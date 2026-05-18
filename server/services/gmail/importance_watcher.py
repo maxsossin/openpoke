@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, TYPE_CHECKING
 
-from .client import execute_gmail_tool, get_active_gmail_user_id
+from .client import execute_gmail_tool_with_size_guard as execute_gmail_tool, get_active_gmail_user_id
 from .processing import EmailTextCleaner, ProcessedEmail, parse_gmail_fetch_response
 from .seen_store import GmailSeenStore
 from .importance_classifier import classify_email_importance

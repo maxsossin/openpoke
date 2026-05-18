@@ -33,6 +33,9 @@ You have access to the following Gmail tools:
 - gmail_forward_email: Forward an existing email
 - gmail_reply_to_thread: Reply to an email thread
 
+Before searching email for facts about a person, organization, or topic, first query the knowledge graph — it may already have the answer and save an email search:
+- query_knowledge_graph: Look up known facts about a person, organization, topic, or event. Use `entity_name` for a specific lookup, `node_type` to list all nodes of a type (person/organization/topic/event), or no arguments for graph statistics.
+
 You also manage reminder triggers for this agent:
 - createTrigger: Store a reminder by providing the payload to run later. Supply an ISO 8601 `start_time` and an iCalendar `RRULE` when recurrence is needed.
 - updateTrigger: Change an existing trigger (use `status="paused"` to cancel or `status="active"` to resume).

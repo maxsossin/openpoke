@@ -10,6 +10,7 @@ from .tools import get_tool_schemas, get_tool_registry
 from ...config import get_settings
 from ...openrouter_client import request_chat_completion
 from ...logging_config import logger
+from ...services.knowledge_graph import get_knowledge_graph_store
 
 
 @dataclass
@@ -39,12 +40,67 @@ class ExecutionAgentRuntime:
         if not self.api_key:
             raise ValueError("OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable.")
 
+    def _prefetch_kg_context(self, instructions: str) -> str:
+        """Return a pre-loaded KG context block for injection into the system prompt.
+
+        Extracts candidate entity names from the instruction text (tokens ≥4 chars
+        that start with an uppercase letter), searches the graph for each, and formats
+        any hits as a compact fact list. Returns an empty string when the graph is empty
+        or no relevant entities are found.
+        """
+        try:
+            store = get_knowledge_graph_store()
+            if store.get_node_count() == 0:
+                return ""
+
+            candidates: set[str] = set()
+            for token in instructions.split():
+                word = token.strip(".,!?\"'()[]:-")
+                if len(word) >= 4 and word[0].isupper() and word.isascii():
+                    candidates.add(word)
+
+            seen_ids: set[int] = set()
+            hits: list[dict] = []
+            for word in sorted(candidates)[:12]:
+                for match in store.search_nodes(word, limit=2):
+                    if match["id"] not in seen_ids:
+                        seen_ids.add(match["id"])
+                        node = store.query_node_by_name(match["canonical_name"])
+                        if node:
+                            hits.append(node)
+
+            if not hits:
+                return ""
+
+            lines = [
+                "# Knowledge Graph Context",
+                "The following facts about relevant entities are pre-loaded from the user's email history:",
+            ]
+            for node in hits[:8]:
+                lines.append(f"\n**{node['canonical_name']}** ({node['node_type']})")
+                for fact in node["facts"][:5]:
+                    lines.append(f"  - {fact['fact_key']}: {fact['fact_value']}")
+                for edge in node["edges"][:3]:
+                    lines.append(f"  - {edge['edge_type']} → {edge['to_name']}")
+
+            logger.debug(
+                "KG context pre-fetched for execution agent",
+                extra={"agent": self.agent.name, "entities": len(hits)},
+            )
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.warning("KG prefetch failed; continuing without context", extra={"error": str(exc)})
+            return ""
+
     # Main execution loop for running agent with LLM calls and tool execution
     async def execute(self, instructions: str) -> ExecutionResult:
         """Execute the agent with given instructions."""
         try:
             # Build system prompt with history
             system_prompt = self.agent.build_system_prompt_with_history()
+            kg_context = self._prefetch_kg_context(instructions)
+            if kg_context:
+                system_prompt = f"{system_prompt}\n\n{kg_context}"
 
             # Start conversation with the instruction
             messages = [{"role": "user", "content": instructions}]

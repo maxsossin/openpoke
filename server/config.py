@@ -56,6 +56,7 @@ class Settings(BaseModel):
     execution_agent_search_model: str = Field(default="deepseek/deepseek-v4-flash")
     summarizer_model: str = Field(default="deepseek/deepseek-v4-flash")
     email_classifier_model: str = Field(default="deepseek/deepseek-v4-flash")
+    knowledge_graph_model: str = Field(default="deepseek/deepseek-v4-flash")
 
     # Credentials / integrations
     openrouter_api_key: Optional[str] = Field(default=os.getenv("OPENROUTER_API_KEY"))

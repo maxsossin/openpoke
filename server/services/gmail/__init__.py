@@ -3,6 +3,7 @@
 from .client import (
     disconnect_account,
     execute_gmail_tool,
+    execute_gmail_tool_with_size_guard,
     fetch_status,
     get_active_gmail_user_id,
     initiate_connect,
@@ -14,6 +15,7 @@ from .seen_store import GmailSeenStore
 
 __all__ = [
     "execute_gmail_tool",
+    "execute_gmail_tool_with_size_guard",
     "fetch_status",
     "initiate_connect",
     "disconnect_account",

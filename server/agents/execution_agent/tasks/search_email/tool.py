@@ -12,7 +12,7 @@ from server.services.execution import get_execution_agent_logs
 from server.services.gmail import (
     EmailTextCleaner,
     ProcessedEmail,
-    execute_gmail_tool,
+    execute_gmail_tool_with_size_guard as execute_gmail_tool,
     get_active_gmail_user_id,
     parse_gmail_fetch_response,
 )
@@ -293,17 +293,14 @@ async def _perform_search(
             error=ERROR_QUERY_REQUIRED,
         )
 
-    # Use LLM-provided max_results or default to 10
-    max_results = arguments.get("max_results", 10)
-    
+    # Cap at 10 to avoid Composio 413 payload errors on large email bodies
+    max_results = min(int(arguments.get("max_results", 10) or 10), 10)
+
     composio_arguments = {
         "query": query,
-        "max_results": max_results,  # Use LLM-provided value or default 10
-        "include_payload": True,  # REQUIRED: Need full email content for text cleaning
-        "verbose": True,  # REQUIRED: Need parsed content including messageText
-        "include_spam_trash": arguments.get("include_spam_trash", False),  # Default: False
-        "format": "full",  # Request full email format
-        "metadata_headers": ["From", "To", "Subject", "Date"],  # Ensure we get key headers
+        "max_results": max_results,
+        "include_payload": True,
+        "include_spam_trash": arguments.get("include_spam_trash", False),
     }
 
     _LOG_STORE.record_action(
