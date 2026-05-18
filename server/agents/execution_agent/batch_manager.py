@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import re
+from datetime import datetime, timezone
+from ...services.execution.descriptor import AgentDescriptor, save_descriptor
+from ...services.execution.vector_index import upsert_descriptor
+from ...services.execution.hot_cache import touch_agent
+from ...openrouter_client import request_chat_completion
+from ...config import get_settings
+
 import asyncio
 import uuid
 from dataclasses import dataclass, field
@@ -11,6 +19,64 @@ from typing import Dict, List, Optional
 from .runtime import ExecutionAgentRuntime, ExecutionResult
 from ...logging_config import logger
 
+
+
+
+# Add this helper at module level (outside the class)
+def _extract_tags(agent_name: str, text: str) -> list[str]:
+    stopwords = {"the", "and", "for", "with", "that", "this", "from", "are",
+                 "you", "was", "has", "have", "been", "will", "its", "not"}
+    tokens = re.findall(r'\b[a-zA-Z]{3,}\b', f"{agent_name} {text}")
+    seen = set()
+    tags = []
+    for t in tokens:
+        tl = t.lower()
+        if tl not in stopwords and tl not in seen:
+            seen.add(tl)
+            tags.append(tl)
+        if len(tags) == 10:
+            break
+    return tags
+
+
+async def _generate_summary(agent_name: str, response: str) -> str:
+    """Single cheap LLM call to produce a one-sentence agent descriptor."""
+    settings = get_settings()
+    prompt = (
+        f"Agent name: {agent_name}\n"
+        f"Final output (truncated): {response[:800]}\n\n"
+        "Write one sentence describing what this agent did and what information it now owns. "
+        "Be specific. No preamble, no punctuation at the end."
+    )
+    try:
+        result = await request_chat_completion(
+            model=settings.execution_agent_model,
+            messages=[{"role": "user", "content": prompt}],
+            system="You write terse, specific one-sentence summaries.",
+            api_key=settings.openrouter_api_key,
+            tools=None,
+        )
+        text = result["choices"][0]["message"]["content"].strip()
+        return text or f"Agent handling: {agent_name}"
+    except Exception as exc:
+        logger.warning(f"Descriptor summary generation failed for {agent_name}: {exc}")
+        return f"Agent handling: {agent_name}"
+
+
+async def _update_agent_descriptor(result: ExecutionResult) -> None:
+    """Generate and persist a descriptor after an agent completes."""
+    summary = await _generate_summary(result.agent_name, result.response)
+    descriptor = AgentDescriptor(
+        agent_name=result.agent_name,
+        summary=summary,
+        tags=_extract_tags(result.agent_name, result.response),
+        last_active=datetime.now(timezone.utc).isoformat(),
+        status="idle" if result.success else "idle",
+        last_output_snippet=result.response[:300],
+    )
+    save_descriptor(descriptor)
+    upsert_descriptor(descriptor)
+    touch_agent(result.agent_name)
 
 @dataclass
 class PendingExecution:
@@ -115,14 +181,7 @@ class ExecutionBatchManager:
             return batch_id
 
     # Store execution result and send combined batch to interaction agent when complete
-    async def _complete_execution(
-        self,
-        batch_id: str,
-        result: ExecutionResult,
-        agent_name: str,
-    ) -> None:
-        """Record the execution result and dispatch when the batch drains."""
-
+    async def _complete_execution(self, batch_id, result, agent_name):
         dispatch_payload: Optional[str] = None
 
         async with self._batch_lock:
@@ -135,8 +194,12 @@ class ExecutionBatchManager:
             state.pending -= 1
 
             if state.pending == 0:
+                # ← Update descriptors for all completed agents before dispatch
+                for r in state.results:
+                    await _update_agent_descriptor(r)
+
                 dispatch_payload = self._format_batch_payload(state.results)
-                agent_names = [entry.agent_name for entry in state.results]
+                agent_names = [r.agent_name for r in state.results]
                 logger.info(f"Execution batch completed: {', '.join(agent_names)}")
                 self._batch_state = None
 

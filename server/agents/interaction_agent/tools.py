@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from ...logging_config import logger
+from ...services.execution.vector_index import search_agents
 from ...services.conversation import get_conversation_log
 from ...services.execution import get_agent_roster, get_execution_agent_logs
 from ..execution_agent.batch_manager import ExecutionBatchManager
+from ...services.execution.hot_cache import touch_agent
 
 
 @dataclass
@@ -88,6 +90,27 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "roster_search",
+            "description": (
+                "Search for existing execution agents by semantic similarity to a query. "
+                "Use this before spawning a new agent to check if one already exists for this task. "
+                "Returns agent names, summaries, statuses, and relevance scores."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language description of the task or agent you're looking for.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wait",
             "description": "Wait silently when a message is already in conversation history to avoid duplicating responses. Adds a <wait> log entry that is not visible to the user.",
             "parameters": {
@@ -108,6 +131,13 @@ TOOL_SCHEMAS = [
 _EXECUTION_BATCH_MANAGER = ExecutionBatchManager()
 
 
+def _roster_search(query: str) -> ToolResult:
+    """Semantic search over existing execution agents."""
+    results = search_agents(query, top_k=5)
+    if not results:
+        return ToolResult(success=True, payload={"matches": [], "message": "No agents found."})
+    return ToolResult(success=True, payload={"matches": results})
+
 # Create or reuse execution agent and dispatch instructions asynchronously
 def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
     """Send instructions to an execution agent."""
@@ -118,6 +148,8 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
 
     if is_new:
         roster.add_agent(agent_name)
+        touch_agent(agent_name)
+
 
     get_execution_agent_logs().record_request(agent_name, instructions)
 
@@ -233,6 +265,8 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
             return send_draft(**args)
         if name == "wait":
             return wait(**args)
+        if name == "roster_search":
+            return _roster_search(**args)
 
         logger.warning("unexpected tool", extra={"tool": name})
         return ToolResult(success=False, payload={"error": f"Unknown tool: {name}"})
