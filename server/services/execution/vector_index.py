@@ -1,5 +1,6 @@
 """Semantic search over agent descriptors using chromadb."""
 
+import threading
 from pathlib import Path
 
 from ...logging_config import logger
@@ -7,15 +8,23 @@ from .descriptor import AgentDescriptor
 
 _CHROMA_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "execution_agents" / "chroma"
 
+_chroma_collection = None
+_chroma_lock = threading.Lock()
+
 
 def _get_collection():
-    import chromadb
-    from chromadb.config import Settings
-    client = chromadb.PersistentClient(
-        path=str(_CHROMA_PATH),
-        settings=Settings(anonymized_telemetry=False),
-    )
-    return client.get_or_create_collection("agents")
+    global _chroma_collection
+    if _chroma_collection is None:
+        with _chroma_lock:
+            if _chroma_collection is None:
+                import chromadb
+                from chromadb.config import Settings
+                client = chromadb.PersistentClient(
+                    path=str(_CHROMA_PATH),
+                    settings=Settings(anonymized_telemetry=False),
+                )
+                _chroma_collection = client.get_or_create_collection("agents")
+    return _chroma_collection
 
 
 def upsert_descriptor(descriptor: AgentDescriptor) -> None:

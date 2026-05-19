@@ -13,12 +13,117 @@ from ...logging_config import logger
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 _DB_PATH = _DATA_DIR / "knowledge_graph.db"
 
+# ChromaDB collection for KG node embeddings, used for entity synonym resolution.
+# Separate from the execution-agent descriptor collection in vector_index.py.
+_KG_CHROMA_PATH = _DATA_DIR / "knowledge_graph" / "chroma"
+
+# Cosine similarity threshold for merging a new node name into an existing node.
+# A submitted name scoring at or above this against an existing node of the same
+# type is treated as a synonym and resolved to the existing canonical name.
+_NODE_SIMILARITY_THRESHOLD = 0.88
+
+_kg_chroma_collection = None
+_kg_chroma_lock = threading.Lock()
+
 CONFIDENCE_THRESHOLD = 0.6
 _STALE_DAYS = 90
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _get_kg_collection():
+    """Get the ChromaDB collection for KG node embeddings.
+
+    Uses double-checked locking (same pattern as vector_index._get_collection).
+    Returns None if ChromaDB is unavailable; callers fall back to exact matching.
+    """
+    global _kg_chroma_collection
+    if _kg_chroma_collection is None:
+        with _kg_chroma_lock:
+            if _kg_chroma_collection is None:
+                try:
+                    import chromadb
+                    from chromadb.config import Settings
+                    _KG_CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+                    client = chromadb.PersistentClient(
+                        path=str(_KG_CHROMA_PATH),
+                        settings=Settings(anonymized_telemetry=False),
+                    )
+                    _kg_chroma_collection = client.get_or_create_collection("kg_nodes")
+                except Exception as exc:
+                    logger.debug(
+                        "KG ChromaDB unavailable; entity synonym resolution disabled: %s", exc
+                    )
+    return _kg_chroma_collection
+
+
+def _resolve_node_name(node_type: str, canonical_name: str) -> str:
+    """Return the canonical_name of an existing node if semantically equivalent.
+
+    Queries ChromaDB for the closest node of the same type. Returns the existing
+    node's canonical_name when similarity >= _NODE_SIMILARITY_THRESHOLD, otherwise
+    returns the submitted canonical_name unchanged.
+
+    Falls back to returning canonical_name (exact-match behaviour) when:
+      - ChromaDB is unavailable
+      - The collection is empty
+      - Any ChromaDB error occurs
+    """
+    try:
+        collection = _get_kg_collection()
+        if collection is None:
+            return canonical_name
+        count = collection.count()
+        if count == 0:
+            return canonical_name
+        results = collection.query(
+            query_texts=[canonical_name],
+            n_results=1,
+            where={"node_type": node_type},
+            include=["documents", "distances"],
+        )
+        ids = (results.get("ids") or [[]])[0]
+        if not ids:
+            return canonical_name
+        best_distance = results["distances"][0][0]
+        best_doc = results["documents"][0][0]
+        similarity = 1.0 - best_distance
+        if similarity >= _NODE_SIMILARITY_THRESHOLD:
+            logger.debug(
+                "Entity synonym resolved to existing node",
+                extra={
+                    "submitted": canonical_name,
+                    "resolved": best_doc,
+                    "node_type": node_type,
+                    "similarity": round(similarity, 3),
+                },
+            )
+            return best_doc
+    except Exception as exc:
+        logger.debug("Entity resolution ChromaDB query failed, using exact match: %s", exc)
+    return canonical_name
+
+
+def _index_node(node_type: str, canonical_name: str) -> None:
+    """Upsert a node into ChromaDB for future entity synonym resolution.
+
+    Idempotent — safe to call on nodes that are already indexed.
+    Silently skips when ChromaDB is unavailable.
+    """
+    try:
+        collection = _get_kg_collection()
+        if collection is None:
+            return
+        doc_id = f"{node_type}::{canonical_name}"
+        collection.upsert(
+            ids=[doc_id],
+            documents=[canonical_name],
+            metadatas=[{"node_type": node_type}],
+        )
+    except Exception as exc:
+        logger.debug("KG node ChromaDB indexing failed: %s", exc)
 
 
 class KnowledgeGraphStore:
@@ -134,20 +239,54 @@ class KnowledgeGraphStore:
     # ------------------------------------------------------------------
 
     def get_or_create_node(self, node_type: str, canonical_name: str) -> int:
-        """Return the node ID, creating the node atomically if it does not exist."""
+        """Return the node ID, creating the node atomically if it does not exist.
+
+        Before creating a new node, a synonym normalization pass runs inside this
+        lock: ChromaDB is queried for an existing node of the same type whose
+        embedding is within _NODE_SIMILARITY_THRESHOLD of canonical_name. If one
+        is found, that node's ID is returned instead of creating a duplicate. This
+        prevents topic fragmentation from synonymous names (e.g. "AI regulation"
+        vs "AI policy"). Falls back to exact matching when ChromaDB is unavailable.
+        """
         now = _utc_now_iso()
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO kg_nodes"
-                " (node_type, canonical_name, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?)",
-                (node_type, canonical_name, now, now),
-            )
+            # Fast path: exact match
             row = conn.execute(
-                "SELECT id FROM kg_nodes WHERE node_type = ? AND canonical_name = ?",
+                "SELECT id FROM kg_nodes"
+                " WHERE node_type = ? AND canonical_name = ? AND is_deprecated = 0",
                 (node_type, canonical_name),
             ).fetchone()
-        return int(row["id"])
+            if row is not None:
+                node_id = int(row["id"])
+            else:
+                # Normalization pass: resolve synonym to an existing node before creating
+                resolved_name = _resolve_node_name(node_type, canonical_name)
+                if resolved_name != canonical_name:
+                    resolved_row = conn.execute(
+                        "SELECT id FROM kg_nodes"
+                        " WHERE node_type = ? AND canonical_name = ? AND is_deprecated = 0",
+                        (node_type, resolved_name),
+                    ).fetchone()
+                    if resolved_row is not None:
+                        # Synonym resolved — return existing node without creating a new one
+                        return int(resolved_row["id"])
+                    # resolved_name not found (stale ChromaDB index); fall through to create
+
+                conn.execute(
+                    "INSERT OR IGNORE INTO kg_nodes"
+                    " (node_type, canonical_name, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (node_type, canonical_name, now, now),
+                )
+                row = conn.execute(
+                    "SELECT id FROM kg_nodes WHERE node_type = ? AND canonical_name = ?",
+                    (node_type, canonical_name),
+                ).fetchone()
+                node_id = int(row["id"])
+
+        # Index outside lock — best-effort, non-atomic with SQLite write; idempotent
+        _index_node(node_type, canonical_name)
+        return node_id
 
     # ------------------------------------------------------------------
     # Facts
@@ -261,6 +400,17 @@ class KnowledgeGraphStore:
                     ),
                 )
                 return True
+            # Update confidence and provenance with the newest evidence
+            conn.execute(
+                "UPDATE kg_edges"
+                " SET confidence = ?, flagged = ?, source_email_id = ?,"
+                "     source_email_timestamp = ?, extracted_at = ?"
+                " WHERE id = ?",
+                (
+                    confidence, flagged, source_email_id,
+                    source_email_timestamp, extracted_at, existing["id"],
+                ),
+            )
         return False
 
     # ------------------------------------------------------------------

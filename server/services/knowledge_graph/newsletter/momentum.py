@@ -23,6 +23,7 @@ not be bypassed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, TYPE_CHECKING
 
 from ..store import KnowledgeGraphStore
@@ -45,6 +46,10 @@ MIN_SOURCES_FOR_ALERT = 2
 
 # Maximum distinct topics surfaced in a single momentum check
 _MAX_ALERTS_PER_CHECK = 3
+
+# A topic that fired a momentum alert cannot fire again within this window.
+# Prevents continuous alerts for sustained trending stories.
+MOMENTUM_ALERT_COOLDOWN_HOURS = 6
 
 
 @dataclass
@@ -71,12 +76,20 @@ async def check_and_surface_momentum(
     Returns the list of accelerating topics (may be empty). Each qualifying
     topic is dispatched once per check via handle_agent_message(); the
     Interaction Agent decides whether to pass it to the user.
+
+    Cooldown: topics alerted within the last MOMENTUM_ALERT_COOLDOWN_HOURS are
+    excluded before dispatch. last_alerted_at is updated atomically with a
+    successful alert — if dispatch raises, the timestamp is not written.
     """
     accelerating = _find_accelerating_topics(kg_store, nl_store)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     for topic in accelerating:
         try:
             await _dispatch_momentum_alert(topic)
+            # Update last_alerted_at only after successful dispatch.
+            # If _dispatch_momentum_alert raises, this line is not reached.
+            nl_store.mark_topic_alerted(topic.topic_node_id, now)
         except Exception as exc:
             logger.exception(
                 "Failed to dispatch momentum alert [topic=%s]: %s",
@@ -92,8 +105,12 @@ def _find_accelerating_topics(
     nl_store: NewsletterGraphStore,
 ) -> List[AcceleratingTopic]:
     """Compute acceleration for all tracked topics and return qualifying ones."""
+    cooldown_cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=MOMENTUM_ALERT_COOLDOWN_HOURS)
+    ).isoformat(timespec="seconds")
     candidate_ids = nl_store.get_all_tracked_topic_ids(
         min_recent_mentions=MIN_MENTIONS_FOR_ALERT,
+        cooldown_cutoff=cooldown_cutoff,
     )
     accelerating: List[AcceleratingTopic] = []
 
@@ -169,6 +186,7 @@ async def _dispatch_momentum_alert(topic: AcceleratingTopic) -> None:
 __all__ = [
     "AcceleratingTopic",
     "MOMENTUM_ACCELERATION_THRESHOLD",
+    "MOMENTUM_ALERT_COOLDOWN_HOURS",
     "MIN_MENTIONS_FOR_ALERT",
     "MIN_SOURCES_FOR_ALERT",
     "check_and_surface_momentum",

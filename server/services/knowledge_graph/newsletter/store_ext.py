@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -80,7 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_kg_topic_attention_topic_date
 
 CREATE TABLE IF NOT EXISTS kg_contrarian_positions (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic_node_id       INTEGER NOT NULL REFERENCES kg_nodes(id),
+    story_node_id       INTEGER NOT NULL REFERENCES kg_nodes(id),
     source_node_id      INTEGER NOT NULL REFERENCES kg_nodes(id),
     position_text       TEXT    NOT NULL,
     prevailing_view     TEXT    NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS kg_contrarian_positions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_kg_contrarian_topic
-    ON kg_contrarian_positions (topic_node_id, status);
+    ON kg_contrarian_positions (story_node_id, status);
 """
 
 # Migrations that add columns to existing tables. Each is tried once;
@@ -100,6 +100,12 @@ CREATE INDEX IF NOT EXISTS idx_kg_contrarian_topic
 _MIGRATIONS = [
     "ALTER TABLE kg_node_facts ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
     "ALTER TABLE kg_edges      ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
+    # Momentum alert cooldown: NULL means the topic has never triggered an alert.
+    "ALTER TABLE kg_topic_attention ADD COLUMN last_alerted_at TEXT",
+    # Rename: the column stored story node IDs, not topic node IDs.
+    # Safe on populated databases (SQLite 3.25+); indexes are updated automatically.
+    # Silently ignored on fresh databases where the schema already uses story_node_id.
+    "ALTER TABLE kg_contrarian_positions RENAME COLUMN topic_node_id TO story_node_id",
 ]
 
 
@@ -108,7 +114,7 @@ def _utc_now_iso() -> str:
 
 
 def _today_iso() -> str:
-    return date.today().isoformat()
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 class NewsletterGraphStore:
@@ -257,31 +263,64 @@ class NewsletterGraphStore:
         *,
         exclude_source_id: Optional[int] = None,
         limit: int = 20,
+        since_days: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Return active framings, newest first, optionally excluding one source."""
+        """Return active framings, newest first, optionally excluding one source.
+
+        since_days: when set, restricts to framings whose source_email_ts is
+        within the last N days (UTC). Use this to avoid months-old framings
+        being treated as the current prevailing view.
+        """
+        cutoff = (
+            (datetime.now(timezone.utc).date() - timedelta(days=since_days)).isoformat()
+            if since_days is not None
+            else None
+        )
         with self._lock, self._connect() as conn:
+            date_clause = " AND sf.source_email_ts > ?" if cutoff else ""
+            excl_clause = " AND sf.source_node_id != ?" if exclude_source_id is not None else ""
+            base = (
+                "SELECT sf.framing_text, sf.sentiment, sf.source_email_ts,"
+                "       n.canonical_name AS source_name, sf.source_node_id"
+                " FROM kg_story_framings sf"
+                " JOIN kg_nodes n ON sf.source_node_id = n.id"
+                f" WHERE sf.story_node_id = ? AND sf.is_active = 1{date_clause}{excl_clause}"
+                " ORDER BY sf.source_email_ts DESC LIMIT ?"
+            )
+            params: list = [story_node_id]
+            if cutoff:
+                params.append(cutoff)
             if exclude_source_id is not None:
-                rows = conn.execute(
-                    "SELECT sf.framing_text, sf.sentiment, sf.source_email_ts,"
-                    "       n.canonical_name AS source_name, sf.source_node_id"
-                    " FROM kg_story_framings sf"
-                    " JOIN kg_nodes n ON sf.source_node_id = n.id"
-                    " WHERE sf.story_node_id = ? AND sf.is_active = 1"
-                    "   AND sf.source_node_id != ?"
-                    " ORDER BY sf.source_email_ts DESC LIMIT ?",
-                    (story_node_id, exclude_source_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT sf.framing_text, sf.sentiment, sf.source_email_ts,"
-                    "       n.canonical_name AS source_name, sf.source_node_id"
-                    " FROM kg_story_framings sf"
-                    " JOIN kg_nodes n ON sf.source_node_id = n.id"
-                    " WHERE sf.story_node_id = ? AND sf.is_active = 1"
-                    " ORDER BY sf.source_email_ts DESC LIMIT ?",
-                    (story_node_id, limit),
-                ).fetchall()
+                params.append(exclude_source_id)
+            params.append(limit)
+            rows = conn.execute(base, params).fetchall()
         return [dict(r) for r in rows]
+
+    def get_recent_framings_for_topic(
+        self,
+        topic_node_id: int,
+        limit: int = 5,
+    ) -> List[str]:
+        """Return recent framing texts from stories involving this topic.
+
+        Traverses kg_edges (story → topic, edge_type='involves') to find stories
+        that cover this topic, then returns their most recent active framings from
+        kg_story_framings. Used by compute_topic_novelty() for semantic comparison.
+
+        Call chain: compute_topic_novelty (novelty.py) → here → SQLite JOIN.
+        Blocking local I/O only; no external calls.
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT sf.framing_text"
+                " FROM kg_story_framings sf"
+                " JOIN kg_edges e ON sf.story_node_id = e.from_node_id"
+                " WHERE e.to_node_id = ? AND e.edge_type = 'involves'"
+                "   AND e.is_active = 1 AND sf.is_active = 1"
+                " ORDER BY sf.source_email_ts DESC LIMIT ?",
+                (topic_node_id, limit),
+            ).fetchall()
+        return [r["framing_text"] for r in rows]
 
     def count_distinct_story_sources(self, story_node_id: int) -> int:
         """Count distinct sources with any active framing for this story."""
@@ -300,7 +339,7 @@ class NewsletterGraphStore:
         window_days: int = 14,
     ) -> int:
         """Count distinct sources with framings in the last window_days days."""
-        cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=window_days)).isoformat()
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(DISTINCT source_node_id)"
@@ -355,7 +394,7 @@ class NewsletterGraphStore:
         days: int = 7,
     ) -> int:
         """Total novel mentions across all sources in the last N days."""
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT COALESCE(SUM(mention_count), 0)"
@@ -373,7 +412,7 @@ class NewsletterGraphStore:
         prior_days: int = 7,
     ) -> Dict[str, Any]:
         """Aggregate stats for recent and prior rolling windows."""
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         recent_start = (today - timedelta(days=recent_days)).isoformat()
         prior_end = recent_start
         prior_start = (today - timedelta(days=recent_days + prior_days)).isoformat()
@@ -403,19 +442,49 @@ class NewsletterGraphStore:
             "prior_intensity": float(prior["intensity"]),
         }
 
-    def get_all_tracked_topic_ids(self, min_recent_mentions: int = 3) -> List[int]:
-        """Topic node IDs with at least min_recent_mentions in the last 7 days."""
-        cutoff = (date.today() - timedelta(days=7)).isoformat()
+    def get_all_tracked_topic_ids(
+        self,
+        min_recent_mentions: int = 3,
+        cooldown_cutoff: Optional[str] = None,
+    ) -> List[int]:
+        """Topic node IDs with at least min_recent_mentions in the last 7 days.
+
+        cooldown_cutoff: when provided (ISO timestamp), topics whose MAX(last_alerted_at)
+        is at or after this value are excluded. This is the momentum alert cooldown
+        check — it runs as a single SQL HAVING condition, not a post-fetch filter.
+        """
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+        params: list = [cutoff, min_recent_mentions]
+        cooldown_clause = ""
+        if cooldown_cutoff is not None:
+            cooldown_clause = " AND COALESCE(MAX(last_alerted_at), '') < ?"
+            params.append(cooldown_cutoff)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT topic_node_id, SUM(mention_count) AS total"
                 " FROM kg_topic_attention"
                 " WHERE window_date > ?"
                 " GROUP BY topic_node_id"
-                " HAVING total >= ?",
-                (cutoff, min_recent_mentions),
+                f" HAVING total >= ?{cooldown_clause}",
+                params,
             ).fetchall()
         return [int(r["topic_node_id"]) for r in rows]
+
+    def mark_topic_alerted(self, topic_node_id: int, alerted_at: str) -> None:
+        """Stamp last_alerted_at on all attention rows for this topic in the current window.
+
+        Updating all rows in the 7-day window ensures MAX(last_alerted_at) is
+        visible to the cooldown check in get_all_tracked_topic_ids() regardless
+        of which specific date row is queried. Must be called only after a
+        successful alert dispatch.
+        """
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE kg_topic_attention SET last_alerted_at = ?"
+                " WHERE topic_node_id = ? AND window_date > ?",
+                (alerted_at, topic_node_id, cutoff),
+            )
 
     def get_node_canonical_name(self, node_id: int) -> Optional[str]:
         with self._lock, self._connect() as conn:
@@ -427,7 +496,7 @@ class NewsletterGraphStore:
 
     def get_top_momentum_topics(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Return topics sorted by recent intensity for query-time surfacing."""
-        cutoff = (date.today() - timedelta(days=7)).isoformat()
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT ta.topic_node_id,"
@@ -452,7 +521,7 @@ class NewsletterGraphStore:
     def upsert_contrarian_position(
         self,
         *,
-        topic_node_id: int,
+        story_node_id: int,
         source_node_id: int,
         position_text: str,
         prevailing_view: str,
@@ -470,20 +539,20 @@ class NewsletterGraphStore:
             existing = conn.execute(
                 "SELECT id, evidence_email_ids, evidence_count, status"
                 " FROM kg_contrarian_positions"
-                " WHERE topic_node_id = ? AND source_node_id = ?"
+                " WHERE story_node_id = ? AND source_node_id = ?"
                 " ORDER BY created_at DESC LIMIT 1",
-                (topic_node_id, source_node_id),
+                (story_node_id, source_node_id),
             ).fetchone()
 
             if existing is None:
                 emails = json.dumps([email_id])
                 conn.execute(
                     "INSERT INTO kg_contrarian_positions"
-                    " (topic_node_id, source_node_id, position_text, prevailing_view,"
+                    " (story_node_id, source_node_id, position_text, prevailing_view,"
                     "  evidence_email_ids, evidence_count, status, created_at, updated_at)"
                     " VALUES (?, ?, ?, ?, ?, 1, 'pending', ?, ?)",
                     (
-                        topic_node_id, source_node_id, position_text,
+                        story_node_id, source_node_id, position_text,
                         prevailing_view, emails, now, now,
                     ),
                 )
@@ -512,28 +581,28 @@ class NewsletterGraphStore:
 
     def get_confirmed_contrarians(
         self,
-        topic_node_id: Optional[int] = None,
+        story_node_id: Optional[int] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Return confirmed contrarian positions, optionally filtered by topic."""
+        """Return confirmed contrarian positions, optionally filtered by story."""
         with self._lock, self._connect() as conn:
-            if topic_node_id is not None:
+            if story_node_id is not None:
                 rows = conn.execute(
                     "SELECT cp.*, n_t.canonical_name AS topic_name,"
                     "        n_s.canonical_name AS source_name"
                     " FROM kg_contrarian_positions cp"
-                    " JOIN kg_nodes n_t ON cp.topic_node_id = n_t.id"
+                    " JOIN kg_nodes n_t ON cp.story_node_id = n_t.id"
                     " JOIN kg_nodes n_s ON cp.source_node_id = n_s.id"
-                    " WHERE cp.topic_node_id = ? AND cp.status = 'confirmed'"
+                    " WHERE cp.story_node_id = ? AND cp.status = 'confirmed'"
                     " ORDER BY cp.updated_at DESC LIMIT ?",
-                    (topic_node_id, limit),
+                    (story_node_id, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT cp.*, n_t.canonical_name AS topic_name,"
                     "        n_s.canonical_name AS source_name"
                     " FROM kg_contrarian_positions cp"
-                    " JOIN kg_nodes n_t ON cp.topic_node_id = n_t.id"
+                    " JOIN kg_nodes n_t ON cp.story_node_id = n_t.id"
                     " JOIN kg_nodes n_s ON cp.source_node_id = n_s.id"
                     " WHERE cp.status = 'confirmed'"
                     " ORDER BY cp.updated_at DESC LIMIT ?",

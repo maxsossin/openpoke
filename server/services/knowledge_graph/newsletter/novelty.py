@@ -24,9 +24,10 @@ Scoring scale:
 from __future__ import annotations
 
 import difflib
-from typing import Optional
+from typing import List, Optional
 
 from .store_ext import NewsletterGraphStore
+from ....logging_config import logger
 
 # Facts below this score are treated as noise for downstream processing.
 # Momentum and story threading only receive facts above this threshold.
@@ -83,13 +84,40 @@ def compute_fact_novelty_score(
 def compute_topic_novelty(
     topic_node_id: int,
     nl_store: NewsletterGraphStore,
+    framing_text: Optional[str] = None,
 ) -> float:
-    """Novelty score for a topic node based solely on recent coverage frequency.
+    """Novelty score for a topic using framing similarity and coverage frequency.
 
-    Used when no existing fact value is available to compare against
-    (e.g. the topic node is new, or only the topic's presence matters).
+    When framing_text is provided, the score compares the current newsletter's
+    framing against the most recent framing for this topic's associated stories
+    via compute_fact_novelty_score() (difflib lexical comparison). This ensures
+    two newsletters covering the same topic from different angles are not treated
+    as identical repetition.
+
+    Framing data is sourced from kg_story_framings via a SQLite JOIN —
+    blocking local I/O only, no external calls.
+
+    Fallback: when framing_text is absent (empty or None), frequency-only scoring
+    is applied and the fallback is logged explicitly.
     """
     recent_count = nl_store.get_topic_recent_mention_count(topic_node_id, days=7)
+
+    if framing_text and framing_text.strip():
+        existing_framings: List[str] = nl_store.get_recent_framings_for_topic(
+            topic_node_id
+        )
+        existing_value = existing_framings[0] if existing_framings else None
+        return compute_fact_novelty_score(
+            new_value=framing_text,
+            existing_value=existing_value,
+            recent_newsletter_mentions=recent_count,
+        )
+
+    # Fallback: no framing text available — frequency-only scoring
+    logger.debug(
+        "Topic novelty: framing text unavailable, using frequency-only scoring",
+        extra={"topic_node_id": topic_node_id},
+    )
     return compute_fact_novelty_score(
         new_value="",
         existing_value=None,

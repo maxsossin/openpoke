@@ -6,7 +6,7 @@ the same story. Dissent is modeled explicitly as a contrarian record and
 surfaced at query time — it is not buried in volume or collapsed into consensus.
 
 Two-stage evidence requirement:
-    CONTRARIAN_MIN_PREVAILING_SOURCES (3) distinct sources must have framed
+    CONTRARIAN_MIN_PREVAILING_SOURCES distinct sources must have framed
     the same story before a "prevailing view" is considered established.
     This prevents a fringe source from being labelled contrarian against
     a non-existent consensus.
@@ -39,10 +39,9 @@ from ....openrouter_client import request_chat_completion
 from ...gmail.processing import ProcessedEmail
 
 # Distinct sources required to establish a prevailing view.
-# Lowered from 3 to 2: with a small corpus (6 sources) and topic synonym
-# fragmentation spreading framings across multiple story nodes, 3 is
-# structurally unreachable in most cases.
-CONTRARIAN_MIN_PREVAILING_SOURCES = 2
+# Entity synonym resolution (Fix 1) consolidates fragmented story nodes so
+# multi-source framing counts are reliably reachable at 3.
+CONTRARIAN_MIN_PREVAILING_SOURCES = 3
 
 # Separate emails from the dissenting source required before 'confirmed'
 CONTRARIAN_MIN_DISSENTER_EVIDENCE = 2
@@ -160,11 +159,13 @@ async def detect_contrarian_position(
         )
         return None
 
-    # Collect prevailing framings from other sources
+    # Collect prevailing framings from other sources, capped to 30 days so
+    # months-old framings cannot dominate the prevailing view assessment.
     prevailing = nl_store.get_story_framings(
         story_node_id,
         exclude_source_id=source_node_id,
         limit=10,
+        since_days=30,
     )
     if len(prevailing) < CONTRARIAN_MIN_PREVAILING_SOURCES:
         return None
@@ -181,7 +182,7 @@ async def detect_contrarian_position(
 
     # Upsert contrarian record
     status, count = nl_store.upsert_contrarian_position(
-        topic_node_id=story_node_id,
+        story_node_id=story_node_id,
         source_node_id=source_node_id,
         position_text=intelligence.framing_text,
         prevailing_view=assessment.prevailing_view_summary,

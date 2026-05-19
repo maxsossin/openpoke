@@ -76,6 +76,7 @@ class NewsletterIntelligenceProcessor:
         self._kg_store = kg_store
         self._nl_store = nl_store
         self._call_count = 0
+        self._momentum_running = False
 
     async def process_email(
         self,
@@ -180,16 +181,19 @@ class NewsletterIntelligenceProcessor:
                     "Contrarian detection failed [email=%s]: %s", email.id, exc,
                 )
 
-        # Phase 6: periodic momentum check (non-blocking background task)
-        if self._call_count % _MOMENTUM_CHECK_INTERVAL == 0:
+        # Phase 6: periodic momentum check (non-blocking background task).
+        # _momentum_running prevents duplicate concurrent tasks when emails
+        # arrive faster than the check completes.
+        if self._call_count % _MOMENTUM_CHECK_INTERVAL == 0 and not self._momentum_running:
             try:
+                self._momentum_running = True
                 loop = asyncio.get_running_loop()
                 loop.create_task(
                     self._run_momentum_check(),
                     name="newsletter-momentum-check",
                 )
             except RuntimeError:
-                pass  # no running loop; skip silently
+                self._momentum_running = False  # no running loop; skip silently
 
         return NewsletterProcessingResult(
             email_id=email.id,
@@ -227,9 +231,10 @@ class NewsletterIntelligenceProcessor:
         """
         novel_ids: List[int] = []
 
+        framing = intelligence.framing_text if intelligence.framing_text.strip() else None
         for topic_name in intelligence.primary_topics:
             topic_node_id = self._kg_store.get_or_create_node("topic", topic_name)
-            novelty = compute_topic_novelty(topic_node_id, self._nl_store)
+            novelty = compute_topic_novelty(topic_node_id, self._nl_store, framing_text=framing)
 
             if novelty <= NOVELTY_THRESHOLD:
                 logger.info(
@@ -263,6 +268,8 @@ class NewsletterIntelligenceProcessor:
                 )
         except Exception as exc:
             logger.exception("Periodic momentum check failed: %s", exc)
+        finally:
+            self._momentum_running = False
 
 
 _processor_instance: Optional[NewsletterIntelligenceProcessor] = None

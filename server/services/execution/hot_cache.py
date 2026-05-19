@@ -9,11 +9,7 @@ _session_cache: OrderedDict[str, dict] = OrderedDict()
 
 
 def touch_agent(agent_name: str) -> None:
-    """Promote an agent to the front of the hot cache."""
-    if agent_name in _session_cache:
-        _session_cache.move_to_end(agent_name)
-        return
-
+    """Promote an agent to the front of the hot cache with fresh data."""
     descriptors = load_descriptors()
     if agent_name in descriptors:
         d = descriptors[agent_name]

@@ -183,6 +183,12 @@ class KnowledgeGraphWatcher:
                     if nl_result.extraction_result:
                         self._apply_extraction(email, nl_result.extraction_result)
                         extracted_count += 1
+                    else:
+                        # Newsletter LLM failed; fall back to standard extraction
+                        fallback = await extract_from_email(email)
+                        if fallback:
+                            self._apply_extraction(email, fallback)
+                            extracted_count += 1
                     logger.info(
                         "Newsletter processed",
                         extra={

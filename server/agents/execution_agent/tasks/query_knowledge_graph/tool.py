@@ -118,18 +118,29 @@ def _handle_newsletter_query(
         }
 
     if mode == "contrarian_positions":
-        topic_node_id: Optional[int] = None
+        # Contrarian records store story node IDs in the story_node_id column.
+        # Resolve: entity_name → story node directly OR topic → linked story nodes.
+        story_node_ids = []
         if entity_name:
             name = entity_name.strip()
-            # Try to resolve the entity to a node_id
-            node = kg_store.query_node_by_name(name)
-            if node:
-                topic_node_id = node["id"]
-        contrarians = nl_store.get_confirmed_contrarians(topic_node_id, limit=20)
+            direct = kg_store.query_node_by_name(name, node_type="story")
+            if direct:
+                story_node_ids = [direct["id"]]
+            else:
+                stories = nl_store.search_stories_by_topic(name)
+                story_node_ids = [s["id"] for s in stories]
+
+        if story_node_ids:
+            all_contrarians = []
+            for sid in story_node_ids:
+                all_contrarians.extend(nl_store.get_confirmed_contrarians(sid, limit=20))
+        else:
+            all_contrarians = nl_store.get_confirmed_contrarians(None, limit=20)
+
         return {
             "mode": "contrarian_positions",
             "filter_topic": entity_name,
-            "count": len(contrarians),
+            "count": len(all_contrarians),
             "positions": [
                 {
                     "topic": c["topic_name"],
@@ -139,7 +150,7 @@ def _handle_newsletter_query(
                     "evidence_count": c["evidence_count"],
                     "updated_at": c["updated_at"],
                 }
-                for c in contrarians
+                for c in all_contrarians
             ],
         }
 

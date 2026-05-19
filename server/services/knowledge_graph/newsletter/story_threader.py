@@ -35,14 +35,14 @@ from ....logging_config import logger
 from ...gmail.processing import ProcessedEmail
 
 # Minimum distinct publications covering a shared topic before a story node
-# is created. Set to 1 because topic canonical names vary across publishers
-# (e.g. "US-China trade relations" vs "US-China relations"), which fragments
-# source counts across separate nodes and makes the 2-source gate structurally
-# unreachable in most cases.
-STORY_MIN_SOURCES = 1
+# is created. Entity synonym resolution (Fix 1) consolidates fragmented topic
+# nodes, making the multi-source gate reliably reachable.
+STORY_MIN_SOURCES = 2
 
-# Word overlap coefficient threshold for matching a title to an existing story
-STORY_MATCH_THRESHOLD = 0.60
+# Word overlap coefficient threshold for matching a title to an existing story.
+# Restored from the compensating value of 0.60; entity resolution reduces false
+# misses that previously required the looser threshold.
+STORY_MATCH_THRESHOLD = 0.75
 
 _STOP_WORDS = frozenset({
     "the", "a", "an", "of", "in", "at", "to", "and", "or", "for", "on",

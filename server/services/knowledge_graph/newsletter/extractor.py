@@ -278,7 +278,43 @@ def _coerce_args(raw: Any) -> Optional[Dict[str, Any]]:
             return json.loads(stripped)
         except json.JSONDecodeError:
             pass
+        # Attempt lenient recovery for common LLM JSON defects:
+        # truncated output (missing closing braces) and trailing commas.
+        recovered = _try_recover_json(stripped)
+        if recovered is not None:
+            return recovered
     return None
+
+
+def _try_recover_json(text: str) -> Optional[Dict[str, Any]]:
+    import re
+
+    # Strip trailing commas before } or ]
+    cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # If truncated, try closing any open braces/brackets
+    open_braces = cleaned.count("{") - cleaned.count("}")
+    open_brackets = cleaned.count("[") - cleaned.count("]")
+    if open_braces > 0 or open_brackets > 0:
+        # Truncate at the last complete value boundary we can find
+        for cutoff in ("]", "}", '"'):
+            last = cleaned.rfind(cutoff)
+            if last != -1:
+                candidate = cleaned[: last + 1]
+                candidate += "]" * max(0, candidate.count("[") - candidate.count("]"))
+                candidate += "}" * max(0, candidate.count("{") - candidate.count("}"))
+                try:
+                    result = json.loads(candidate)
+                    if isinstance(result, dict):
+                        return result
+                except json.JSONDecodeError:
+                    continue
+
+    try:
+        result = json.loads(cleaned)
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _parse(args: Dict[str, Any]) -> NewsletterIntelligence:

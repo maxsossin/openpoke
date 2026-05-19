@@ -22,6 +22,14 @@ from ...logging_config import logger
 
 
 
+def _log_task_exception(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.exception(
+            "Interaction agent dispatch task failed",
+            exc_info=task.exception(),
+        )
+
+
 # Add this helper at module level (outside the class)
 def _extract_tags(agent_name: str, text: str) -> list[str]:
     stopwords = {"the", "and", "for", "with", "that", "this", "from", "are",
@@ -71,7 +79,7 @@ async def _update_agent_descriptor(result: ExecutionResult) -> None:
         summary=summary,
         tags=_extract_tags(result.agent_name, result.response),
         last_active=datetime.now(timezone.utc).isoformat(),
-        status="idle" if result.success else "idle",
+        status="idle" if result.success else "error",
         last_output_snippet=result.response[:300],
     )
     save_descriptor(descriptor)
@@ -182,7 +190,7 @@ class ExecutionBatchManager:
 
     # Store execution result and send combined batch to interaction agent when complete
     async def _complete_execution(self, batch_id, result, agent_name):
-        dispatch_payload: Optional[str] = None
+        completed_results: Optional[List[ExecutionResult]] = None
 
         async with self._batch_lock:
             state = self._batch_state
@@ -194,16 +202,16 @@ class ExecutionBatchManager:
             state.pending -= 1
 
             if state.pending == 0:
-                # ← Update descriptors for all completed agents before dispatch
-                for r in state.results:
-                    await _update_agent_descriptor(r)
-
-                dispatch_payload = self._format_batch_payload(state.results)
-                agent_names = [r.agent_name for r in state.results]
+                completed_results = list(state.results)
+                agent_names = [r.agent_name for r in completed_results]
                 logger.info(f"Execution batch completed: {', '.join(agent_names)}")
                 self._batch_state = None
 
-        if dispatch_payload:
+        # Lock released — descriptor updates involve LLM calls and must not hold the batch lock
+        if completed_results is not None:
+            for r in completed_results:
+                await _update_agent_descriptor(r)
+            dispatch_payload = self._format_batch_payload(completed_results)
             await self._dispatch_to_interaction_agent(dispatch_payload)
 
     # Return list of currently pending execution requests for monitoring purposes
@@ -253,4 +261,5 @@ class ExecutionBatchManager:
             asyncio.run(runtime.handle_agent_message(payload))
             return
 
-        loop.create_task(runtime.handle_agent_message(payload))
+        task = loop.create_task(runtime.handle_agent_message(payload))
+        task.add_done_callback(_log_task_exception)
