@@ -10,6 +10,7 @@ from ..gmail.client import execute_gmail_tool_with_size_guard as execute_gmail_t
 from ..gmail.processing import EmailTextCleaner, ProcessedEmail, parse_gmail_fetch_response
 from .extractor import ExtractionResult, extract_from_email
 from .store import KnowledgeGraphStore, get_knowledge_graph_store
+from .newsletter.processor import NewsletterProcessingResult, get_newsletter_processor
 from ...logging_config import logger
 
 _DEFAULT_POLL_INTERVAL_SECONDS = 60.0
@@ -157,13 +158,52 @@ class KnowledgeGraphWatcher:
                 )
 
     async def _extract_batch(self, emails: List[ProcessedEmail]) -> None:
+        """Extract knowledge graph facts from a batch of unprocessed emails.
+
+        Newsletter emails are routed through the newsletter intelligence
+        processor, which: classifies the source, runs a combined LLM
+        extraction, scores topic novelty, threads story nodes, and detects
+        contrarian positions. The processor returns an ExtractionResult that
+        is then fed into the standard _apply_extraction() path so all KG
+        writes remain consistent. Non-newsletter emails follow the original
+        extract_from_email() → _apply_extraction() path unchanged.
+        """
+        processor = get_newsletter_processor()
         extracted_count = 0
+
         for email in emails:
             try:
-                result = await extract_from_email(email)
-                if result:
-                    self._apply_extraction(email, result)
-                    extracted_count += 1
+                # Newsletter path: combined extraction + intelligence pipeline
+                nl_result: NewsletterProcessingResult | None = (
+                    await processor.process_email(email)
+                )
+
+                if nl_result is not None:
+                    # Newsletter: use extraction result returned by processor
+                    if nl_result.extraction_result:
+                        self._apply_extraction(email, nl_result.extraction_result)
+                        extracted_count += 1
+                    logger.info(
+                        "Newsletter processed",
+                        extra={
+                            "email_id": email.id,
+                            "publication": nl_result.source_name,
+                            "novel_topics": nl_result.novel_topic_count,
+                            "story": (
+                                nl_result.story_result.story_name
+                                if nl_result.story_result
+                                else None
+                            ),
+                            "contrarian_status": nl_result.contrarian_status,
+                        },
+                    )
+                else:
+                    # Standard path: unchanged
+                    result = await extract_from_email(email)
+                    if result:
+                        self._apply_extraction(email, result)
+                        extracted_count += 1
+
             except Exception as exc:
                 logger.warning(
                     "Failed to extract KG facts from email",
@@ -251,6 +291,16 @@ class KnowledgeGraphWatcher:
                     "Failed to write edge to knowledge graph",
                     extra={"error": str(exc)},
                 )
+
+
+    async def process_batch(self, emails: List[ProcessedEmail]) -> None:
+        """Public entry point for external callers (e.g. backfill tooling).
+
+        Runs the same classification → extraction → KG-write pipeline as the
+        normal poll loop, then marks each email processed so it won't be
+        re-attempted by future polls.
+        """
+        await self._extract_batch(emails)
 
 
 _watcher_instance: Optional[KnowledgeGraphWatcher] = None

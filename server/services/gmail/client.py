@@ -487,6 +487,8 @@ def execute_gmail_tool(
         )
         return _normalize_tool_response(result)
     except Exception as exc:
+        if "413" in str(exc):
+            raise RuntimeError(f"{tool_name} invocation failed: {exc}") from exc
         logger.exception(
             "gmail tool execution failed",
             extra={"tool": tool_name, "user_id": composio_user_id},

@@ -70,6 +70,10 @@ class InteractionAgentRuntime:
             self.conversation_log.record_user_message(user_message)
 
             system_prompt = build_system_prompt()
+            logger.debug(
+                "Interaction agent system prompt loaded",
+                extra={"prompt_length": len(system_prompt)},
+            )
             messages = prepare_message_with_history(
                 user_message, transcript_before, message_type="user"
             )
@@ -89,7 +93,7 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent failed", extra={"error": str(exc)})
+            logger.exception("Interaction agent failed: %s", exc)
             return InteractionResult(
                 success=False,
                 response="",
@@ -124,7 +128,7 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent (agent message) failed", extra={"error": str(exc)})
+            logger.exception("Interaction agent (agent message) failed: %s", exc)
             return InteractionResult(
                 success=False,
                 response="",
@@ -142,7 +146,12 @@ class InteractionAgentRuntime:
         summary = _LoopSummary()
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
-            response = await self._make_llm_call(system_prompt, messages)
+            logger.debug("Interaction loop iteration %d", iteration)
+            try:
+                response = await self._make_llm_call(system_prompt, messages)
+            except Exception as exc:
+                logger.exception("LLM call failed on iteration %d: %s", iteration, exc)
+                raise
             assistant_message = self._extract_assistant_message(response)
 
             assistant_content = (assistant_message.get("content") or "").strip()

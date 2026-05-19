@@ -8,13 +8,12 @@ from html import escape
 from ...services.execution import get_agent_roster
 
 _prompt_path = Path(__file__).parent / "system_prompt.md"
-SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8").strip()
 
 
 # Load and return the pre-defined system prompt from markdown file
 def build_system_prompt() -> str:
-    """Return the static system prompt for the interaction agent."""
-    return SYSTEM_PROMPT
+    """Read and return the interaction agent system prompt from disk."""
+    return _prompt_path.read_text(encoding="utf-8").strip()
 
 
 # Build structured message with conversation history, active agents, and current turn
