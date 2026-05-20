@@ -10,6 +10,7 @@ from ...config import get_settings
 from ...services.conversation import get_conversation_log, get_working_memory_log
 from ...openrouter_client import request_chat_completion
 from ...logging_config import logger
+from ..execution_agent.runtime import _build_kg_context_block
 
 
 @dataclass
@@ -70,10 +71,22 @@ class InteractionAgentRuntime:
             self.conversation_log.record_user_message(user_message)
 
             system_prompt = build_system_prompt()
-            logger.debug(
-                "Interaction agent system prompt loaded",
-                extra={"prompt_length": len(system_prompt)},
-            )
+            # Proactive KG context injection: embed relevant entity facts directly
+            # into the system prompt when the user's message references graph entities.
+            # This allows the agent to answer entity questions in a single turn without
+            # an extra query_knowledge_graph tool call round-trip.
+            kg_context = _build_kg_context_block(user_message)
+            if kg_context:
+                system_prompt = f"{system_prompt}\n\n{kg_context}"
+                logger.debug(
+                    "KG context injected into interaction agent system prompt",
+                    extra={"prompt_length": len(system_prompt)},
+                )
+            else:
+                logger.debug(
+                    "Interaction agent system prompt loaded",
+                    extra={"prompt_length": len(system_prompt)},
+                )
             messages = prepare_message_with_history(
                 user_message, transcript_before, message_type="user"
             )

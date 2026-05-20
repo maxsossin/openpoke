@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -12,10 +13,6 @@ from ...logging_config import logger
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 _DB_PATH = _DATA_DIR / "knowledge_graph.db"
-
-# ChromaDB collection for KG node embeddings, used for entity synonym resolution.
-# Separate from the execution-agent descriptor collection in vector_index.py.
-_KG_CHROMA_PATH = _DATA_DIR / "knowledge_graph" / "chroma"
 
 # Cosine similarity threshold for merging a new node name into an existing node.
 # A submitted name scoring at or above this against an existing node of the same
@@ -44,14 +41,13 @@ def _get_kg_collection():
         with _kg_chroma_lock:
             if _kg_chroma_collection is None:
                 try:
-                    import chromadb
-                    from chromadb.config import Settings
-                    _KG_CHROMA_PATH.mkdir(parents=True, exist_ok=True)
-                    client = chromadb.PersistentClient(
-                        path=str(_KG_CHROMA_PATH),
-                        settings=Settings(anonymized_telemetry=False),
-                    )
-                    _kg_chroma_collection = client.get_or_create_collection("kg_nodes")
+                    from .shared_chroma import get_chroma_client
+                    client = get_chroma_client()
+                    if client is not None:
+                        _kg_chroma_collection = client.get_or_create_collection(
+                            "kg_nodes",
+                            metadata={"hnsw:space": "cosine"},
+                        )
                 except Exception as exc:
                     logger.debug(
                         "KG ChromaDB unavailable; entity synonym resolution disabled: %s", exc
@@ -59,12 +55,20 @@ def _get_kg_collection():
     return _kg_chroma_collection
 
 
-def _resolve_node_name(node_type: str, canonical_name: str) -> str:
+def _resolve_node_name(
+    node_type: str,
+    canonical_name: str,
+    threshold: float = _NODE_SIMILARITY_THRESHOLD,
+) -> str:
     """Return the canonical_name of an existing node if semantically equivalent.
 
     Queries ChromaDB for the closest node of the same type. Returns the existing
-    node's canonical_name when similarity >= _NODE_SIMILARITY_THRESHOLD, otherwise
-    returns the submitted canonical_name unchanged.
+    node's canonical_name when similarity >= threshold, otherwise returns the
+    submitted canonical_name unchanged.
+
+    threshold defaults to _NODE_SIMILARITY_THRESHOLD (0.88) for entity resolution.
+    Story title matching uses a lower threshold (0.80) because titles legitimately
+    vary more than entity names.
 
     Falls back to returning canonical_name (exact-match behaviour) when:
       - ChromaDB is unavailable
@@ -90,7 +94,7 @@ def _resolve_node_name(node_type: str, canonical_name: str) -> str:
         best_distance = results["distances"][0][0]
         best_doc = results["documents"][0][0]
         similarity = 1.0 - best_distance
-        if similarity >= _NODE_SIMILARITY_THRESHOLD:
+        if similarity >= threshold:
             logger.debug(
                 "Entity synonym resolved to existing node",
                 extra={
@@ -98,6 +102,7 @@ def _resolve_node_name(node_type: str, canonical_name: str) -> str:
                     "resolved": best_doc,
                     "node_type": node_type,
                     "similarity": round(similarity, 3),
+                    "threshold": threshold,
                 },
             )
             return best_doc
@@ -173,6 +178,7 @@ class KnowledgeGraphStore:
             confidence              REAL    NOT NULL DEFAULT 1.0,
             is_active               INTEGER NOT NULL DEFAULT 1,
             flagged                 INTEGER NOT NULL DEFAULT 0,
+            novelty_score           REAL    NOT NULL DEFAULT 1.0,
             source_email_id         TEXT    NOT NULL,
             source_email_timestamp  TEXT    NOT NULL,
             extracted_at            TEXT    NOT NULL,
@@ -194,10 +200,12 @@ class KnowledgeGraphStore:
             confidence              REAL    NOT NULL DEFAULT 1.0,
             is_active               INTEGER NOT NULL DEFAULT 1,
             flagged                 INTEGER NOT NULL DEFAULT 0,
+            novelty_score           REAL    NOT NULL DEFAULT 1.0,
             source_email_id         TEXT    NOT NULL,
             source_email_timestamp  TEXT    NOT NULL,
             extracted_at            TEXT    NOT NULL,
-            created_at              TEXT    NOT NULL
+            created_at              TEXT    NOT NULL,
+            properties              TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_kg_edges_from_active
@@ -302,6 +310,7 @@ class KnowledgeGraphStore:
         source_email_id: str,
         source_email_timestamp: str,
         extracted_at: str,
+        novelty_score: float = 1.0,
     ) -> Tuple[bool, bool]:
         """Insert or update a node fact atomically.
 
@@ -327,11 +336,12 @@ class KnowledgeGraphStore:
                 conn.execute(
                     "INSERT INTO kg_node_facts"
                     " (node_id, fact_key, fact_value, version, confidence,"
-                    "  is_active, flagged, source_email_id, source_email_timestamp,"
+                    "  is_active, flagged, novelty_score, source_email_id, source_email_timestamp,"
                     "  extracted_at, created_at)"
-                    " VALUES (?, ?, ?, 1, ?, 1, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, 1, ?, 1, ?, ?, ?, ?, ?, ?)",
                     (
                         node_id, fact_key, fact_value, confidence, flagged,
+                        novelty_score,
                         source_email_id, source_email_timestamp, extracted_at, now,
                     ),
                 )
@@ -351,12 +361,13 @@ class KnowledgeGraphStore:
             conn.execute(
                 "INSERT INTO kg_node_facts"
                 " (node_id, fact_key, fact_value, version, confidence,"
-                "  is_active, flagged, source_email_id, source_email_timestamp,"
+                "  is_active, flagged, novelty_score, source_email_id, source_email_timestamp,"
                 "  extracted_at, created_at)"
-                " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
                 (
                     node_id, fact_key, fact_value, existing_version + 1,
                     confidence, flagged,
+                    novelty_score,
                     source_email_id, source_email_timestamp, extracted_at, now,
                 ),
             )
@@ -372,13 +383,20 @@ class KnowledgeGraphStore:
         source_email_id: str,
         source_email_timestamp: str,
         extracted_at: str,
+        properties: Optional[Dict[str, Any]] = None,
+        novelty_score: float = 1.0,
     ) -> bool:
         """Insert an edge if no active edge of the same type exists between these nodes.
+
+        properties: optional JSON-serialisable dict stored on the edge (e.g.
+            {"role": "CTO", "since": "2022"} for a works_at edge). NULL properties
+            means no properties — compatible with all existing rows.
 
         Returns True if a new edge was inserted.
         """
         now = _utc_now_iso()
         flagged = 1 if confidence < CONFIDENCE_THRESHOLD else 0
+        props_json: Optional[str] = json.dumps(properties) if properties else None
 
         with self._lock, self._connect() as conn:
             existing = conn.execute(
@@ -391,24 +409,32 @@ class KnowledgeGraphStore:
                 conn.execute(
                     "INSERT INTO kg_edges"
                     " (from_node_id, to_node_id, edge_type, version, confidence,"
-                    "  is_active, flagged, source_email_id, source_email_timestamp,"
-                    "  extracted_at, created_at)"
-                    " VALUES (?, ?, ?, 1, ?, 1, ?, ?, ?, ?, ?)",
+                    "  is_active, flagged, novelty_score, source_email_id, source_email_timestamp,"
+                    "  extracted_at, created_at, properties)"
+                    " VALUES (?, ?, ?, 1, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         from_node_id, to_node_id, edge_type, confidence, flagged,
+                        novelty_score,
                         source_email_id, source_email_timestamp, extracted_at, now,
+                        props_json,
                     ),
                 )
                 return True
-            # Update confidence and provenance with the newest evidence
+            # Confidence is monotonically non-decreasing: use MAX so a low-quality
+            # re-observation cannot overwrite high-confidence established evidence.
+            # COALESCE preserves existing properties when the new edge carries none.
+            # Provenance (source_email_id, source_email_timestamp, extracted_at) is
+            # immutable: the first observation establishes authorship and must not be
+            # overwritten by later re-observations of the same edge.
             conn.execute(
                 "UPDATE kg_edges"
-                " SET confidence = ?, flagged = ?, source_email_id = ?,"
-                "     source_email_timestamp = ?, extracted_at = ?"
+                " SET confidence = MAX(confidence, ?),"
+                "     flagged = CASE WHEN MAX(confidence, ?) >= ? THEN 0 ELSE flagged END,"
+                "     properties = COALESCE(?, properties)"
                 " WHERE id = ?",
                 (
-                    confidence, flagged, source_email_id,
-                    source_email_timestamp, extracted_at, existing["id"],
+                    confidence, confidence, CONFIDENCE_THRESHOLD,
+                    props_json, existing["id"],
                 ),
             )
         return False
@@ -491,18 +517,25 @@ class KnowledgeGraphStore:
 
             edges = conn.execute(
                 f"SELECT e.edge_type, e.confidence, e.version,"
-                f" n.node_type AS to_type, n.canonical_name AS to_name"
+                f" n.node_type AS to_type, n.canonical_name AS to_name,"
+                f" e.properties"
                 f" FROM kg_edges e JOIN kg_nodes n ON e.to_node_id = n.id"
                 f" WHERE e.from_node_id = ? AND e.is_active = 1{flagged_clause}",
                 (node_id,),
             ).fetchall()
+
+        def _deserialize_edge(e: sqlite3.Row) -> dict:
+            row = dict(e)
+            props_raw = row.get("properties")
+            row["properties"] = json.loads(props_raw) if isinstance(props_raw, str) else props_raw
+            return row
 
         return {
             "id": node_id,
             "node_type": row["node_type"],
             "canonical_name": row["canonical_name"],
             "facts": [dict(f) for f in facts],
-            "edges": [dict(e) for e in edges],
+            "edges": [_deserialize_edge(e) for e in edges],
         }
 
     def query_nodes_by_type(
@@ -553,15 +586,84 @@ class KnowledgeGraphStore:
 
     def search_nodes(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Case-insensitive substring search over canonical_name."""
-        pattern = f"%{query}%"
+        safe_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{safe_query}%"
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT id, node_type, canonical_name FROM kg_nodes"
-                " WHERE canonical_name LIKE ? AND is_deprecated = 0"
+                " WHERE canonical_name LIKE ? ESCAPE '\\' AND is_deprecated = 0"
                 " ORDER BY canonical_name LIMIT ?",
                 (pattern, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def query_nodes_by_edge_target(
+        self,
+        to_node_id: int,
+        edge_type: str,
+        include_flagged: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return nodes that have an active edge of edge_type pointing TO to_node_id.
+
+        Enables reverse lookups such as "who works_at Acme Corp?" without
+        enumerating all person nodes. Each result includes the edge confidence
+        and any edge properties.
+        """
+        flagged_clause = "" if include_flagged else " AND e.flagged = 0"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT n.id, n.node_type, n.canonical_name,"
+                f" e.confidence AS edge_confidence, e.properties AS edge_properties"
+                f" FROM kg_edges e JOIN kg_nodes n ON e.from_node_id = n.id"
+                f" WHERE e.to_node_id = ? AND e.edge_type = ? AND e.is_active = 1"
+                f"{flagged_clause}",
+                (to_node_id, edge_type),
+            ).fetchall()
+
+        def _deserialize_row(r: sqlite3.Row) -> dict:
+            row = dict(r)
+            props_raw = row.get("edge_properties")
+            row["edge_properties"] = (
+                json.loads(props_raw) if isinstance(props_raw, str) else props_raw
+            )
+            return row
+
+        return [_deserialize_row(r) for r in rows]
+
+    def query_entities_semantically(
+        self,
+        text: str,
+        n_results: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return up to n_results entity names whose embeddings are closest to text.
+
+        Uses the kg_nodes ChromaDB collection. Returns a list of dicts with
+        keys: id (chroma doc id), canonical_name, node_type, similarity.
+        Returns an empty list when ChromaDB is unavailable or the collection is empty.
+        """
+        try:
+            collection = _get_kg_collection()
+            if collection is None or collection.count() == 0:
+                return []
+            results = collection.query(
+                query_texts=[text],
+                n_results=min(n_results, collection.count()),
+                include=["documents", "distances", "metadatas"],
+            )
+            docs = (results.get("documents") or [[]])[0]
+            distances = (results.get("distances") or [[]])[0]
+            metas = (results.get("metadatas") or [[]])[0]
+            out = []
+            for doc, dist, meta in zip(docs, distances, metas):
+                out.append({
+                    "canonical_name": doc,
+                    "node_type": (meta or {}).get("node_type", ""),
+                    "similarity": round(1.0 - dist, 4),
+                })
+            return out
+        except Exception as exc:
+            logger.debug("Semantic entity query failed: %s", exc)
+            return []
 
     def get_node_count(self) -> int:
         with self._lock, self._connect() as conn:

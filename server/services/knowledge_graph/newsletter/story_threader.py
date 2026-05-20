@@ -26,9 +26,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from ..store import KnowledgeGraphStore
+from ..store import KnowledgeGraphStore, _resolve_node_name
 from .store_ext import NewsletterGraphStore
 from .extractor import NewsletterIntelligence
 from ....logging_config import logger
@@ -67,9 +67,15 @@ def _content_words(text: str) -> frozenset[str]:
 
 
 def _word_overlap(a: str, b: str) -> float:
-    """Overlap coefficient: intersection / min(|A|, |B|)."""
+    """Overlap coefficient: intersection / min(|A|, |B|).
+
+    Returns 0.0 when either title has fewer than 2 content words — a single
+    shared word (e.g. "policy") would otherwise produce a spurious 1.0 score.
+    Titles with only one content word fall through to the ChromaDB semantic
+    fallback in _find_matching_story.
+    """
     wa, wb = _content_words(a), _content_words(b)
-    if not wa or not wb:
+    if len(wa) < 2 or len(wb) < 2:
         return 0.0
     return len(wa & wb) / min(len(wa), len(wb))
 
@@ -102,7 +108,21 @@ def _find_matching_story(
             if best is None or overlap > best[2]:
                 best = (c["id"], c["canonical_name"], overlap)
 
-    return best
+    if best is not None:
+        return best
+
+    # Semantic fallback: word overlap failed — use ChromaDB embedding similarity.
+    # Uses a lower threshold (0.80) than entity resolution (0.88) because story
+    # titles legitimately vary more than entity names (e.g. "AI Governance" vs
+    # "Artificial Intelligence Policy"). _resolve_node_name returns the existing
+    # node's canonical_name when similarity >= threshold, else the input unchanged.
+    resolved = _resolve_node_name("story", story_title, threshold=0.80)
+    if resolved != story_title:
+        node = kg_store.query_node_by_name(resolved, node_type="story")
+        if node is not None:
+            return (node["id"], node["canonical_name"], 0.80)
+
+    return None
 
 
 async def thread_story(
@@ -111,6 +131,7 @@ async def thread_story(
     intelligence: NewsletterIntelligence,
     source_node_id: int,
     topic_node_ids: List[int],
+    topic_novelty_scores: Dict[int, float],
     kg_store: KnowledgeGraphStore,
     nl_store: NewsletterGraphStore,
     extracted_at: str,
@@ -125,12 +146,18 @@ async def thread_story(
     it is never deduplicated or collapsed.
     """
     if not intelligence.has_story or not intelligence.has_framing:
+        if intelligence.has_story and not intelligence.has_framing:
+            logger.warning(
+                "Story title present but no framing; LLM response malformed",
+                extra={"email_id": email.id, "story_title": intelligence.story_title},
+            )
         return StoryThreadResult(
             story_node_id=None, story_name="", was_created=False, framing_id=None,
         )
 
     story_title = intelligence.story_title
     source_ts = email.timestamp.isoformat(timespec="seconds")
+    story_novelty = min(topic_novelty_scores.values()) if topic_novelty_scores else 1.0
 
     # --- Step 1: Try to match an existing story ---
     match = _find_matching_story(story_title, kg_store)
@@ -165,6 +192,15 @@ async def thread_story(
                     "required": STORY_MIN_SOURCES,
                 },
             )
+            nl_store.store_pending_framing(
+                story_title=story_title,
+                source_node_id=source_node_id,
+                framing_text=intelligence.framing_text,
+                sentiment=intelligence.sentiment,
+                source_email_id=email.id,
+                source_email_ts=source_ts,
+                key_claim=intelligence.key_claim,
+            )
             return StoryThreadResult(
                 story_node_id=None,
                 story_name=story_title,
@@ -185,6 +221,7 @@ async def thread_story(
             source_email_id=email.id,
             source_email_timestamp=source_ts,
             extracted_at=extracted_at,
+            novelty_score=story_novelty,
         )
         kg_store.upsert_fact(
             node_id=story_node_id,
@@ -194,6 +231,7 @@ async def thread_story(
             source_email_id=email.id,
             source_email_timestamp=source_ts,
             extracted_at=extracted_at,
+            novelty_score=story_novelty,
         )
 
         # Link story → each novel topic
@@ -206,6 +244,7 @@ async def thread_story(
                 source_email_id=email.id,
                 source_email_timestamp=source_ts,
                 extracted_at=extracted_at,
+                novelty_score=topic_novelty_scores.get(topic_id, story_novelty),
             )
 
         logger.info(
@@ -217,6 +256,30 @@ async def thread_story(
             },
         )
 
+        # Flush framings held while source coverage was below threshold.
+        # Ordered by created_at ASC so the timeline is chronologically correct.
+        # novelty_score defaults to 1.0: original scores are not persisted in
+        # kg_pending_framings, and these sources were genuinely early/novel.
+        for pf in nl_store.pop_pending_framings(story_title):
+            nl_store.insert_story_framing(
+                story_node_id=story_node_id,
+                source_node_id=pf["source_node_id"],
+                framing_text=pf["framing_text"],
+                sentiment=pf["sentiment"],
+                source_email_id=pf["source_email_id"],
+                source_email_ts=pf["source_email_ts"],
+                key_claim=pf["key_claim"],
+            )
+            kg_store.upsert_edge(
+                from_node_id=pf["source_node_id"],
+                to_node_id=story_node_id,
+                edge_type="covers",
+                confidence=0.95,
+                source_email_id=pf["source_email_id"],
+                source_email_timestamp=pf["source_email_ts"],
+                extracted_at=extracted_at,
+            )
+
     # --- Step 4: Record this source's framing (always) ---
     framing_id = nl_store.insert_story_framing(
         story_node_id=story_node_id,
@@ -225,6 +288,7 @@ async def thread_story(
         sentiment=intelligence.sentiment,
         source_email_id=email.id,
         source_email_ts=source_ts,
+        key_claim=intelligence.key_claim,
     )
 
     # Mark source as covering this story (one active edge per source per story)
@@ -236,6 +300,7 @@ async def thread_story(
         source_email_id=email.id,
         source_email_timestamp=source_ts,
         extracted_at=extracted_at,
+        novelty_score=story_novelty,
     )
 
     return StoryThreadResult(

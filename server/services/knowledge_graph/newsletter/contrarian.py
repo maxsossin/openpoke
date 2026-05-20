@@ -167,14 +167,16 @@ async def detect_contrarian_position(
         limit=10,
         since_days=30,
     )
-    if len(prevailing) < CONTRARIAN_MIN_PREVAILING_SOURCES:
+    distinct_prevailing_sources = len({f["source_node_id"] for f in prevailing})
+    if distinct_prevailing_sources < CONTRARIAN_MIN_PREVAILING_SOURCES:
         return None
 
-    # LLM assessment
+    # LLM assessment — include key claims for direct claim-vs-claim comparison
     assessment = await _assess_via_llm(
         new_framing=intelligence.framing_text,
         new_sentiment=intelligence.sentiment,
         prevailing_framings=prevailing,
+        new_key_claim=intelligence.key_claim,
     )
 
     if assessment is None or not assessment.is_contrarian:
@@ -208,20 +210,33 @@ async def _assess_via_llm(
     new_framing: str,
     new_sentiment: str,
     prevailing_framings: List[Dict[str, Any]],
+    new_key_claim: str = "",
 ) -> Optional[ContrarianAssessment]:
-    """Single LLM call to assess whether new_framing contradicts prevailing_framings."""
+    """Single LLM call to assess whether new_framing contradicts prevailing_framings.
+
+    new_key_claim: the most specific, falsifiable claim from the new framing.
+    When present, it is included verbatim alongside prevailing key_claims so the
+    LLM can perform direct claim-vs-claim comparison — the strongest signal of
+    a genuine factual contradiction.
+    """
     settings = get_settings()
     api_key = settings.openrouter_api_key
     if not api_key:
         return None
 
-    prevailing_text = "\n".join(
-        f"  [{f['source_name']} / {f['sentiment']}]: {f['framing_text']}"
-        for f in prevailing_framings[:8]
-    )
+    prevailing_lines = []
+    for f in prevailing_framings[:8]:
+        line = f"  [{f['source_name']} / {f['sentiment']}]: {f['framing_text']}"
+        claim = (f.get("key_claim") or "").strip()
+        if claim:
+            line += f" [CLAIM: {claim}]"
+        prevailing_lines.append(line)
+    prevailing_text = "\n".join(prevailing_lines)
 
+    claim_line = f"\nNEW CLAIM: {new_key_claim.strip()}\n" if new_key_claim.strip() else ""
     user_content = (
-        f"NEW FRAMING (sentiment: {new_sentiment}):\n{new_framing}\n\n"
+        f"NEW FRAMING (sentiment: {new_sentiment}):\n{new_framing}"
+        f"{claim_line}\n"
         f"PREVAILING FRAMINGS FROM OTHER SOURCES:\n{prevailing_text}"
     )
 

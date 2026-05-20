@@ -23,7 +23,10 @@ def _get_collection():
                     path=str(_CHROMA_PATH),
                     settings=Settings(anonymized_telemetry=False),
                 )
-                _chroma_collection = client.get_or_create_collection("agents")
+                _chroma_collection = client.get_or_create_collection(
+                    "agents",
+                    metadata={"hnsw:space": "cosine"},
+                )
     return _chroma_collection
 
 

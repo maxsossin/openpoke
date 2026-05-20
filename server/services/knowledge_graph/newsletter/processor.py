@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..store import KnowledgeGraphStore
 from ..extractor import ExtractionResult
@@ -93,13 +93,13 @@ class NewsletterIntelligenceProcessor:
 
         # Phase 0: classify (fast heuristic — no LLM)
         classification = classify_newsletter(email)
-        self._nl_store.record_newsletter_meta(
-            email_id=email.id,
-            source_node_id=None,
-            is_newsletter=classification.is_newsletter,
-        )
 
         if not classification.is_newsletter:
+            self._nl_store.record_newsletter_meta(
+                email_id=email.id,
+                source_node_id=None,
+                is_newsletter=False,
+            )
             return None
 
         logger.debug(
@@ -114,7 +114,13 @@ class NewsletterIntelligenceProcessor:
         # Phase 1: ensure source node
         source_node_id = self._ensure_source_node(classification)
         self._nl_store.increment_source_email_count(source_node_id)
-        self._nl_store.update_newsletter_meta_source(email.id, source_node_id)
+        # Write meta with source_node_id known — single atomic write avoids a
+        # NULL source_node_id record if the process crashes between record and update.
+        self._nl_store.record_newsletter_meta(
+            email_id=email.id,
+            source_node_id=source_node_id,
+            is_newsletter=True,
+        )
 
         # Phase 2: newsletter-specific LLM extraction
         intelligence = await extract_newsletter_intelligence(email)
@@ -130,7 +136,7 @@ class NewsletterIntelligenceProcessor:
         extracted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # Phase 3: novelty scoring — gate for all downstream phases
-        novel_topic_ids, novel_count = self._score_and_record_topics(
+        novel_topic_ids, novel_count, topic_novelty_scores = self._score_and_record_topics(
             intelligence=intelligence,
             source_node_id=source_node_id,
         )
@@ -149,6 +155,7 @@ class NewsletterIntelligenceProcessor:
                     intelligence=intelligence,
                     source_node_id=source_node_id,
                     topic_node_ids=novel_topic_ids,
+                    topic_novelty_scores=topic_novelty_scores,
                     kg_store=self._kg_store,
                     nl_store=self._nl_store,
                     extracted_at=extracted_at,
@@ -156,6 +163,25 @@ class NewsletterIntelligenceProcessor:
             except Exception as exc:
                 logger.exception(
                     "Story threading failed [email=%s]: %s", email.id, exc,
+                )
+
+        # Phase 4b: persist key claim when story was created or matched
+        if (
+            story_result is not None
+            and story_result.story_node_id is not None
+            and intelligence.key_claim.strip()
+        ):
+            try:
+                self._nl_store.insert_claim(
+                    story_node_id=story_result.story_node_id,
+                    source_node_id=source_node_id,
+                    claim_text=intelligence.key_claim,
+                    claim_date=email.timestamp.date().isoformat(),
+                    source_email_id=email.id,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Claim persistence failed [email=%s]: %s", email.id, exc,
                 )
 
         # Phase 5: contrarian detection (story must exist and have framing history)
@@ -180,6 +206,15 @@ class NewsletterIntelligenceProcessor:
                 logger.exception(
                     "Contrarian detection failed [email=%s]: %s", email.id, exc,
                 )
+
+        # Phase 5b: refresh the per-source sentiment fingerprint so the
+        # source_consistency_profile query mode returns current data.
+        try:
+            self._nl_store.update_source_sentiment_profile(source_node_id)
+        except Exception as exc:
+            logger.exception(
+                "Sentiment profile update failed [email=%s]: %s", email.id, exc,
+            )
 
         # Phase 6: periodic momentum check (non-blocking background task).
         # _momentum_running prevents duplicate concurrent tasks when emails
@@ -222,19 +257,37 @@ class NewsletterIntelligenceProcessor:
         *,
         intelligence: NewsletterIntelligence,
         source_node_id: int,
-    ) -> Tuple[List[int], int]:
+    ) -> Tuple[List[int], int, Dict[int, float]]:
         """Score each primary topic and record attention for novel ones.
 
-        Returns (novel_topic_ids, novel_count). Topics below NOVELTY_THRESHOLD
-        are filtered out here — they never reach story threading, momentum, or
-        contrarian analysis.
+        Returns (novel_topic_ids, novel_count, topic_novelty_scores). Topics
+        below NOVELTY_THRESHOLD are filtered out here — they never reach story
+        threading, momentum, or contrarian analysis. topic_novelty_scores maps
+        each novel topic_node_id to its computed score for downstream use.
         """
         novel_ids: List[int] = []
+        novel_scores: Dict[int, float] = {}
 
         framing = intelligence.framing_text if intelligence.framing_text.strip() else None
+
+        # For continuing stories, resolve the existing story_node_id so that
+        # semantic novelty comparisons are scoped to framings of the same story.
+        # When the story does not exist yet (first coverage), story_node_id is
+        # None and compute_topic_novelty falls back to difflib.
+        story_node_id: Optional[int] = None
+        if intelligence.story_title:
+            existing_story = self._kg_store.query_node_by_name(
+                intelligence.story_title, node_type="story"
+            )
+            if existing_story:
+                story_node_id = existing_story["id"]
+
         for topic_name in intelligence.primary_topics:
             topic_node_id = self._kg_store.get_or_create_node("topic", topic_name)
-            novelty = compute_topic_novelty(topic_node_id, self._nl_store, framing_text=framing)
+            novelty = compute_topic_novelty(
+                topic_node_id, self._nl_store,
+                framing_text=framing, story_node_id=story_node_id,
+            )
 
             if novelty <= NOVELTY_THRESHOLD:
                 logger.info(
@@ -248,13 +301,14 @@ class NewsletterIntelligenceProcessor:
                 continue
 
             novel_ids.append(topic_node_id)
+            novel_scores[topic_node_id] = novelty
             self._nl_store.record_topic_attention(
                 topic_node_id=topic_node_id,
                 source_node_id=source_node_id,
                 novelty_score=novelty,
             )
 
-        return novel_ids, len(novel_ids)
+        return novel_ids, len(novel_ids), novel_scores
 
     async def _run_momentum_check(self) -> None:
         try:

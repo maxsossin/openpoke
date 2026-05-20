@@ -20,6 +20,7 @@ def query_knowledge_graph(
     node_type: Optional[str] = None,
     list_type: Optional[str] = None,
     newsletter_query: Optional[str] = None,
+    reverse_lookup: Optional[str] = None,
 ) -> Any:
     """Query the knowledge graph for entities, facts, and relationships.
 
@@ -27,10 +28,16 @@ def query_knowledge_graph(
     Read-only: no writes are performed here or anywhere reachable from here.
 
     newsletter_query modes add access to the newsletter intelligence layer:
-        story_narrative      — full framing timeline for a story or topic
-        momentum_topics      — topics with accelerating coverage this week
-        contrarian_positions — confirmed dissenting positions
-        newsletter_sources   — tracked publications
+        story_narrative           — full framing timeline for a story or topic
+        momentum_topics           — topics with accelerating coverage this week
+        contrarian_positions      — confirmed dissenting positions
+        newsletter_sources        — tracked publications with credibility data
+        stories_covering_topic    — story nodes linked to a topic (two-hop)
+        topics_covered_by_source  — topics covered by a source (two-hop)
+        source_consistency_profile — per-topic sentiment fingerprint for a source
+
+    reverse_lookup: edge_type for reverse edge lookup. When set with entity_name,
+        returns all nodes with an active edge of this type pointing TO the entity.
     """
     store = get_knowledge_graph_store()
 
@@ -40,6 +47,10 @@ def query_knowledge_graph(
             newsletter_query,
             entity_name=entity_name,
         )
+
+    # ---- Reverse edge lookup -------------------------------------------
+    if reverse_lookup and entity_name:
+        return _handle_reverse_lookup(entity_name.strip(), reverse_lookup.strip(), store)
 
     # ---- Standard entity lookup ----------------------------------------
     if entity_name:
@@ -90,8 +101,48 @@ def query_knowledge_graph(
         "message": (
             "Provide entity_name to look up a specific entity, "
             "list_type to enumerate entities of a given type, "
+            "reverse_lookup with entity_name for reverse edge traversal, "
             "or newsletter_query for newsletter intelligence queries."
         ),
+    }
+
+
+def _handle_reverse_lookup(
+    entity_name: str,
+    edge_type: str,
+    store: Any,
+) -> Any:
+    """Return all nodes with an active edge of edge_type pointing TO entity_name."""
+    if not entity_name:
+        return {"error": "reverse_lookup requires entity_name to identify the target node"}
+
+    target = store.query_node_by_name(entity_name)
+    if target is None:
+        candidates = store.search_nodes(entity_name)
+        if candidates:
+            return {
+                "result": None,
+                "message": f"No exact match for '{entity_name}'. Possible matches below.",
+                "candidates": candidates,
+            }
+        return {"result": None, "message": f"No entity found matching '{entity_name}'."}
+
+    sources = store.query_nodes_by_edge_target(target["id"], edge_type)
+    logger.debug(
+        "KG reverse lookup",
+        extra={
+            "target": entity_name,
+            "edge_type": edge_type,
+            "result_count": len(sources),
+        },
+    )
+    return {
+        "mode": "reverse_lookup",
+        "target_entity": entity_name,
+        "target_id": target["id"],
+        "edge_type": edge_type,
+        "count": len(sources),
+        "sources": sources,
     }
 
 
@@ -143,7 +194,7 @@ def _handle_newsletter_query(
             "count": len(all_contrarians),
             "positions": [
                 {
-                    "topic": c["topic_name"],
+                    "story": c["story_name"],
                     "dissenting_source": c["source_name"],
                     "position": c["position_text"],
                     "prevailing_view": c["prevailing_view"],
@@ -163,9 +214,70 @@ def _handle_newsletter_query(
                 {
                     "publication": s["publication_name"],
                     "emails_processed": s["email_count"],
+                    "claim_accuracy": (
+                        round(s["claim_correct_count"] / s["claim_total_count"], 3)
+                        if s.get("claim_total_count")
+                        else None
+                    ),
+                    "avg_novelty_score": s.get("avg_novelty_score"),
                 }
                 for s in sources
             ],
+        }
+
+    if mode == "stories_covering_topic":
+        if not entity_name or not entity_name.strip():
+            return {"error": "stories_covering_topic requires entity_name set to a topic name"}
+        stories = nl_store.get_stories_covering_topic(entity_name.strip())
+        return {
+            "mode": "stories_covering_topic",
+            "topic": entity_name,
+            "count": len(stories),
+            "stories": stories,
+        }
+
+    if mode == "topics_covered_by_source":
+        if not entity_name or not entity_name.strip():
+            return {
+                "error": "topics_covered_by_source requires entity_name set to a publication name"
+            }
+        topics = nl_store.get_topics_covered_by_source(entity_name.strip())
+        return {
+            "mode": "topics_covered_by_source",
+            "source": entity_name,
+            "count": len(topics),
+            "topics": topics,
+        }
+
+    if mode == "source_consistency_profile":
+        if not entity_name or not entity_name.strip():
+            return {
+                "error": (
+                    "source_consistency_profile requires entity_name set to a publication name"
+                )
+            }
+        name = entity_name.strip()
+        source_node = kg_store.query_node_by_name(name, node_type="newsletter_source")
+        if source_node is None:
+            return {"error": f"No newsletter source found matching '{name}'"}
+        import json as _json
+        sources = nl_store.get_all_sources()
+        profile_json = next(
+            (s.get("sentiment_profile", "{}") for s in sources if s["node_id"] == source_node["id"]),
+            "{}",
+        )
+        try:
+            profile = _json.loads(profile_json) if isinstance(profile_json, str) else profile_json
+        except Exception:
+            profile = {}
+        return {
+            "mode": "source_consistency_profile",
+            "source": name,
+            "profile": profile,
+            "hint": (
+                "Call update_source_sentiment_profile via the store API to refresh "
+                "the profile before querying if it appears stale."
+            ),
         }
 
     return {"error": f"Unknown newsletter_query mode: '{mode}'"}

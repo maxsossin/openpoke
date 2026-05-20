@@ -23,7 +23,13 @@ _SCHEMAS: List[Dict[str, Any]] = [
                 "  'momentum_topics' — topics with accelerating newsletter coverage this week.\n"
                 "  'contrarian_positions' — confirmed dissenting positions relative to consensus. "
                 "Optionally filtered by topic via entity_name.\n"
-                "  'newsletter_sources' — known publication sources in the corpus."
+                "  'newsletter_sources' — known publication sources with credibility metrics.\n"
+                "  'stories_covering_topic' — story nodes whose involves edges point to a "
+                "topic matching entity_name. Two-hop traversal: topic ← story.\n"
+                "  'topics_covered_by_source' — topic nodes reachable from a source via "
+                "covers → involves edges. entity_name is the publication name.\n"
+                "  'source_consistency_profile' — per-topic sentiment fingerprint for a "
+                "publication. entity_name is the publication name."
             ),
             "parameters": {
                 "type": "object",
@@ -65,14 +71,31 @@ _SCHEMAS: List[Dict[str, Any]] = [
                             "momentum_topics",
                             "contrarian_positions",
                             "newsletter_sources",
+                            "stories_covering_topic",
+                            "topics_covered_by_source",
+                            "source_consistency_profile",
                         ],
                         "description": (
                             "Activate a newsletter-specific query mode. "
                             "story_narrative: requires entity_name (story title or topic). "
                             "momentum_topics: returns topics accelerating in coverage this week. "
-                            "contrarian_positions: returns confirmed dissenting positions; "
+                            "contrarian_positions: confirmed dissenting positions; "
                             "optionally filtered by entity_name. "
-                            "newsletter_sources: lists all tracked publications."
+                            "newsletter_sources: all tracked publications with credibility data. "
+                            "stories_covering_topic: stories linked to entity_name topic. "
+                            "topics_covered_by_source: topics covered by entity_name publication. "
+                            "source_consistency_profile: sentiment fingerprint for entity_name publication."
+                        ),
+                    },
+                    "reverse_lookup": {
+                        "type": "string",
+                        "description": (
+                            "When set, performs a reverse edge lookup: returns all nodes that "
+                            "have an active edge of this type pointing TO the entity identified "
+                            "by entity_name. Example: entity_name='Acme Corp', "
+                            "reverse_lookup='works_at' returns everyone who works at Acme Corp. "
+                            "Supported edge types: works_at, involved_in, mentions, knows, "
+                            "covers, involves, precedes, caused_by, follows_from."
                         ),
                     },
                 },

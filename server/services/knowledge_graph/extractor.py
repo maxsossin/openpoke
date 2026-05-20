@@ -96,9 +96,23 @@ _EXTRACT_TOOL_SCHEMA: Dict[str, Any] = {
                                     "involved_in",
                                     "mentions",
                                     "knows",
+                                    "precedes",
+                                    "caused_by",
+                                    "contradicts_story",
+                                    "follows_from",
                                 ],
                             },
                             "confidence": {"type": "number"},
+                            "edge_properties": {
+                                "type": "object",
+                                "description": (
+                                    "Optional semantic properties on the edge. "
+                                    "For works_at: {\"role\": \"CTO\", \"since\": \"2022\"}. "
+                                    "For involved_in: {\"capacity\": \"lead investor\"}. "
+                                    "Omit when no meaningful properties exist."
+                                ),
+                                "additionalProperties": {"type": "string"},
+                            },
                         },
                         "required": ["from_entity", "to_entity", "edge_type", "confidence"],
                         "additionalProperties": False,
@@ -145,6 +159,7 @@ class ExtractedRelationship:
     to_entity: str
     edge_type: str
     confidence: float
+    edge_properties: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -294,11 +309,18 @@ def _parse_extraction(args: Dict[str, Any]) -> ExtractionResult:
         except (TypeError, ValueError):
             confidence = 1.0
         confidence = max(0.0, min(1.0, confidence))
+        raw_props = raw.get("edge_properties")
+        edge_properties = (
+            {str(k): str(v) for k, v in raw_props.items()}
+            if isinstance(raw_props, dict) and raw_props
+            else None
+        )
         relationships.append(ExtractedRelationship(
             from_entity=from_entity,
             to_entity=to_entity,
             edge_type=edge_type,
             confidence=confidence,
+            edge_properties=edge_properties,
         ))
 
     return ExtractionResult(entities=entities, relationships=relationships)

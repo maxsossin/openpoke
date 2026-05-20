@@ -275,7 +275,17 @@ class KnowledgeGraphWatcher:
 
         for rel in result.relationships:
             from_id = name_to_node_id.get(rel.from_entity)
+            if from_id is None:
+                existing = self._store.query_node_by_name(rel.from_entity, node_type="story")
+                if existing:
+                    from_id = existing["id"]
+
             to_id = name_to_node_id.get(rel.to_entity)
+            if to_id is None:
+                existing = self._store.query_node_by_name(rel.to_entity, node_type="story")
+                if existing:
+                    to_id = existing["id"]
+
             if from_id is None or to_id is None:
                 logger.debug(
                     "Skipping edge: one or both entities not found in current extraction",
@@ -291,6 +301,7 @@ class KnowledgeGraphWatcher:
                     source_email_id=email.id,
                     source_email_timestamp=source_email_timestamp,
                     extracted_at=extracted_at,
+                    properties=rel.edge_properties if rel.edge_properties else None,
                 )
             except Exception as exc:
                 logger.warning(

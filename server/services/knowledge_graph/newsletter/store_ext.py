@@ -93,19 +93,59 @@ CREATE TABLE IF NOT EXISTS kg_contrarian_positions (
 
 CREATE INDEX IF NOT EXISTS idx_kg_contrarian_topic
     ON kg_contrarian_positions (story_node_id, status);
+
+CREATE TABLE IF NOT EXISTS kg_claims (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    story_node_id       INTEGER REFERENCES kg_nodes(id),
+    source_node_id      INTEGER REFERENCES kg_nodes(id),
+    claim_text          TEXT    NOT NULL,
+    claim_date          TEXT    NOT NULL,
+    verification_status TEXT    NOT NULL DEFAULT 'pending',
+    verified_at         TEXT,
+    source_email_id     TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_claims_story
+    ON kg_claims (story_node_id, verification_status);
+
+CREATE TABLE IF NOT EXISTS kg_pending_framings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    story_title     TEXT    NOT NULL,
+    source_node_id  INTEGER NOT NULL REFERENCES kg_nodes(id),
+    framing_text    TEXT    NOT NULL,
+    sentiment       TEXT    NOT NULL DEFAULT 'neutral',
+    source_email_id TEXT    NOT NULL,
+    source_email_ts TEXT    NOT NULL,
+    key_claim       TEXT    NOT NULL DEFAULT '',
+    created_at      TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_pending_framings_title
+    ON kg_pending_framings (story_title);
 """
 
 # Migrations that add columns to existing tables. Each is tried once;
 # "duplicate column name" errors are silently swallowed.
 _MIGRATIONS = [
-    "ALTER TABLE kg_node_facts ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
-    "ALTER TABLE kg_edges      ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
     # Momentum alert cooldown: NULL means the topic has never triggered an alert.
     "ALTER TABLE kg_topic_attention ADD COLUMN last_alerted_at TEXT",
     # Rename: the column stored story node IDs, not topic node IDs.
     # Safe on populated databases (SQLite 3.25+); indexes are updated automatically.
     # Silently ignored on fresh databases where the schema already uses story_node_id.
     "ALTER TABLE kg_contrarian_positions RENAME COLUMN topic_node_id TO story_node_id",
+    # Edge property payload — NULL means no properties (all existing rows safe).
+    "ALTER TABLE kg_edges ADD COLUMN properties TEXT",
+    # Key claim persisted on story framings for claim-vs-claim contrarian assessment.
+    "ALTER TABLE kg_story_framings ADD COLUMN key_claim TEXT NOT NULL DEFAULT ''",
+    # Source credibility scoring — updated by claim verification and novelty scorer.
+    "ALTER TABLE kg_newsletter_sources ADD COLUMN claim_correct_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE kg_newsletter_sources ADD COLUMN claim_total_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE kg_newsletter_sources ADD COLUMN avg_novelty_score REAL NOT NULL DEFAULT 1.0",
+    # Source consistency profiling — JSON fingerprint updated by aggregation query.
+    "ALTER TABLE kg_newsletter_sources ADD COLUMN sentiment_profile TEXT NOT NULL DEFAULT '{}'",
+    # Novelty at first observation — 1.0 for all pre-existing rows (safe on populated databases).
+    "ALTER TABLE kg_node_facts ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
+    "ALTER TABLE kg_edges ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
 ]
 
 
@@ -142,8 +182,14 @@ class NewsletterGraphStore:
             try:
                 with self._lock, self._connect() as conn:
                     conn.execute(sql)
-            except Exception:
-                pass  # column already exists; safe to ignore
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if (
+                    "duplicate column name" not in msg
+                    and "already exists" not in msg
+                    and "no such column" not in msg  # RENAME COLUMN already applied
+                ):
+                    raise
 
     # ------------------------------------------------------------------
     # Newsletter sources
@@ -187,15 +233,6 @@ class NewsletterGraphStore:
                 (node_id,),
             )
 
-    def get_all_sources(self) -> List[Dict[str, Any]]:
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                "SELECT ks.node_id, ks.publication_name, ks.sender_patterns,"
-                "       ks.email_count, n.canonical_name"
-                " FROM kg_newsletter_sources ks"
-                " JOIN kg_nodes n ON ks.node_id = n.id",
-            ).fetchall()
-        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Newsletter email metadata
@@ -236,26 +273,41 @@ class NewsletterGraphStore:
         sentiment: str,
         source_email_id: str,
         source_email_ts: str,
+        key_claim: str = "",
     ) -> int:
         """Insert a framing record and return its ID.
 
         Each framing is a distinct row even when the same source covers
         the same story repeatedly. Callers must not deduplicate framings —
         the timeline of evolving perspectives is the signal.
+
+        key_claim: the most specific, falsifiable claim from this framing.
+        Stored for claim-vs-claim contrarian assessment (Fix 6). Defaults to
+        empty string for callers that do not supply a claim.
         """
         now = _utc_now_iso()
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO kg_story_framings"
                 " (story_node_id, source_node_id, framing_text, sentiment,"
-                "  source_email_id, source_email_ts, created_at, is_active)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                "  source_email_id, source_email_ts, created_at, is_active, key_claim)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
                 (
                     story_node_id, source_node_id, framing_text, sentiment,
-                    source_email_id, source_email_ts, now,
+                    source_email_id, source_email_ts, now, key_claim,
                 ),
             )
-            return cursor.lastrowid  # type: ignore[return-value]
+            framing_id: int = cursor.lastrowid  # type: ignore[assignment]
+
+        # Index this framing in ChromaDB so future semantic novelty checks can
+        # compare against it. Best-effort: SQLite write already succeeded.
+        try:
+            from .novelty import index_framing_text
+            index_framing_text(framing_id, framing_text, story_node_id)
+        except Exception:
+            pass
+
+        return framing_id
 
     def get_story_framings(
         self,
@@ -281,7 +333,8 @@ class NewsletterGraphStore:
             excl_clause = " AND sf.source_node_id != ?" if exclude_source_id is not None else ""
             base = (
                 "SELECT sf.framing_text, sf.sentiment, sf.source_email_ts,"
-                "       n.canonical_name AS source_name, sf.source_node_id"
+                "       n.canonical_name AS source_name, sf.source_node_id,"
+                "       COALESCE(sf.key_claim, '') AS key_claim"
                 " FROM kg_story_framings sf"
                 " JOIN kg_nodes n ON sf.source_node_id = n.id"
                 f" WHERE sf.story_node_id = ? AND sf.is_active = 1{date_clause}{excl_clause}"
@@ -349,6 +402,58 @@ class NewsletterGraphStore:
                 (story_node_id, cutoff),
             ).fetchone()
         return int(row[0])
+
+    def store_pending_framing(
+        self,
+        *,
+        story_title: str,
+        source_node_id: int,
+        framing_text: str,
+        sentiment: str,
+        source_email_id: str,
+        source_email_ts: str,
+        key_claim: str = "",
+    ) -> None:
+        """Hold a framing for a story that has not yet accumulated enough source coverage.
+
+        Called from thread_story when max_sources < STORY_MIN_SOURCES. The
+        framing is linked to a real story_node once coverage threshold is met,
+        preserving the full framing timeline from the first publisher onward.
+        """
+        now = _utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO kg_pending_framings"
+                " (story_title, source_node_id, framing_text, sentiment,"
+                "  source_email_id, source_email_ts, key_claim, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    story_title, source_node_id, framing_text, sentiment,
+                    source_email_id, source_email_ts, key_claim, now,
+                ),
+            )
+
+    def pop_pending_framings(self, story_title: str) -> List[Dict[str, Any]]:
+        """Return and delete all pending framings for the given story title.
+
+        Called immediately after a story node is created so the full framing
+        timeline (including pre-creation publishers) is stored in kg_story_framings.
+        Rows are ordered by created_at ASC to preserve chronological sequence.
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT source_node_id, framing_text, sentiment,"
+                "       source_email_id, source_email_ts, key_claim"
+                " FROM kg_pending_framings WHERE story_title = ?"
+                " ORDER BY created_at ASC",
+                (story_title,),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    "DELETE FROM kg_pending_framings WHERE story_title = ?",
+                    (story_title,),
+                )
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Topic attention (momentum)
@@ -588,7 +693,7 @@ class NewsletterGraphStore:
         with self._lock, self._connect() as conn:
             if story_node_id is not None:
                 rows = conn.execute(
-                    "SELECT cp.*, n_t.canonical_name AS topic_name,"
+                    "SELECT cp.*, n_t.canonical_name AS story_name,"
                     "        n_s.canonical_name AS source_name"
                     " FROM kg_contrarian_positions cp"
                     " JOIN kg_nodes n_t ON cp.story_node_id = n_t.id"
@@ -599,7 +704,7 @@ class NewsletterGraphStore:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT cp.*, n_t.canonical_name AS topic_name,"
+                    "SELECT cp.*, n_t.canonical_name AS story_name,"
                     "        n_s.canonical_name AS source_name"
                     " FROM kg_contrarian_positions cp"
                     " JOIN kg_nodes n_t ON cp.story_node_id = n_t.id"
@@ -657,19 +762,284 @@ class NewsletterGraphStore:
 
     def search_stories_by_topic(self, topic_name: str) -> List[Dict[str, Any]]:
         """Story nodes linked to a topic by name (substring match)."""
-        pattern = f"%{topic_name}%"
+        safe = topic_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{safe}%"
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT n.id, n.canonical_name"
                 " FROM kg_nodes n"
-                " JOIN kg_edges e ON e.from_node_id = n.id AND e.is_active = 1"
-                " JOIN kg_nodes nt ON e.to_node_id = nt.id"
+                " JOIN kg_edges e ON e.from_node_id = n.id"
+                "   AND e.edge_type = 'involves' AND e.is_active = 1"
+                " JOIN kg_nodes nt ON e.to_node_id = nt.id AND nt.node_type = 'topic'"
                 " WHERE n.node_type = 'story'"
-                "   AND (nt.canonical_name LIKE ? OR n.canonical_name LIKE ?)"
+                "   AND (nt.canonical_name LIKE ? ESCAPE '\\' OR n.canonical_name LIKE ? ESCAPE '\\')"
                 " LIMIT 10",
                 (pattern, pattern),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Multi-hop traversal queries
+    # ------------------------------------------------------------------
+
+    def get_stories_covering_topic(
+        self,
+        topic_name: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Two-hop: story nodes whose involves edges point to a topic matching topic_name.
+
+        Traversal: topic_node ← (involves) ← story_node.
+        Returns story id, canonical_name, and the matched topic name.
+        """
+        safe = topic_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{safe}%"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT s.id, s.canonical_name, t.canonical_name AS topic_name"
+                " FROM kg_nodes t"
+                " JOIN kg_edges e ON t.id = e.to_node_id"
+                "   AND e.edge_type = 'involves' AND e.is_active = 1"
+                " JOIN kg_nodes s ON e.from_node_id = s.id"
+                "   AND s.node_type = 'story' AND s.is_deprecated = 0"
+                " WHERE t.node_type = 'topic' AND t.canonical_name LIKE ? ESCAPE '\\'"
+                " LIMIT ?",
+                (pattern, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_topics_covered_by_source(
+        self,
+        source_name: str,
+        days: int = 30,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Two-hop: topic nodes reachable from a source via covers → involves edges.
+
+        Traversal: source_node → (covers) → story_node → (involves) → topic_node.
+        days: restrict the source → story covers edges to those whose
+        source_email_timestamp is within the last N days.
+        """
+        safe = source_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{safe}%"
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT t.id, t.canonical_name, t.node_type"
+                " FROM kg_nodes src"
+                " JOIN kg_edges e1 ON src.id = e1.from_node_id"
+                "   AND e1.edge_type = 'covers' AND e1.is_active = 1"
+                "   AND e1.source_email_timestamp > ?"
+                " JOIN kg_nodes s ON e1.to_node_id = s.id"
+                "   AND s.node_type = 'story' AND s.is_deprecated = 0"
+                " JOIN kg_edges e2 ON s.id = e2.from_node_id"
+                "   AND e2.edge_type = 'involves' AND e2.is_active = 1"
+                " JOIN kg_nodes t ON e2.to_node_id = t.id"
+                "   AND t.node_type = 'topic' AND t.is_deprecated = 0"
+                " WHERE src.node_type = 'newsletter_source'"
+                "   AND src.canonical_name LIKE ? ESCAPE '\\' AND src.is_deprecated = 0"
+                " LIMIT ?",
+                (cutoff, pattern, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Claim tracking
+    # ------------------------------------------------------------------
+
+    def insert_claim(
+        self,
+        *,
+        story_node_id: Optional[int],
+        source_node_id: int,
+        claim_text: str,
+        claim_date: str,
+        source_email_id: str,
+    ) -> int:
+        """Insert a new claim record and return its ID.
+
+        Persists the key_claim extracted by the newsletter LLM into a
+        dedicated table linked to the story and source. Verification status
+        starts as 'pending' and is updated by external verification passes.
+        """
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO kg_claims"
+                " (story_node_id, source_node_id, claim_text, claim_date,"
+                "  verification_status, verified_at, source_email_id)"
+                " VALUES (?, ?, ?, ?, 'pending', NULL, ?)",
+                (story_node_id, source_node_id, claim_text, claim_date, source_email_id),
+            )
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    def increment_claim_count(self, source_node_id: int) -> None:
+        """Increment claim_total_count for a newsletter source.
+
+        Separate from mark_claim_verified so callers can count submitted
+        claims independently of whether they have been verified.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE kg_newsletter_sources"
+                " SET claim_total_count = claim_total_count + 1"
+                " WHERE node_id = ?",
+                (source_node_id,),
+            )
+
+    def mark_claim_verified(
+        self,
+        claim_id: int,
+        *,
+        is_correct: bool,
+        novelty_score: Optional[float] = None,
+    ) -> None:
+        """Record the outcome of a claim verification and update source credibility.
+
+        Updates verification_status and verified_at on the claim row, then
+        atomically increments claim_total_count (and claim_correct_count when
+        is_correct=True) on the source. When novelty_score is provided,
+        avg_novelty_score is updated using the incremental running-average
+        formula — (old_avg * old_count + new_score) / new_count — so precision
+        is not lost through a cumulative-sum approach.
+        """
+        now = _utc_now_iso()
+        status = "correct" if is_correct else "incorrect"
+
+        with self._lock, self._connect() as conn:
+            claim_row = conn.execute(
+                "SELECT source_node_id FROM kg_claims WHERE id = ?",
+                (claim_id,),
+            ).fetchone()
+            if claim_row is None:
+                return
+            source_node_id = int(claim_row["source_node_id"])
+
+            conn.execute(
+                "UPDATE kg_claims SET verification_status = ?, verified_at = ? WHERE id = ?",
+                (status, now, claim_id),
+            )
+
+            if novelty_score is not None:
+                # avg_novelty_score in the SET expression uses the OLD claim_total_count
+                # (SQLite evaluates all SET RHS with pre-update row values) so the
+                # incremental formula (old_avg * old_count + new_score) / (old_count + 1)
+                # is computed correctly before claim_total_count is incremented.
+                conn.execute(
+                    "UPDATE kg_newsletter_sources"
+                    " SET claim_total_count  = claim_total_count + 1,"
+                    "     claim_correct_count = claim_correct_count + ?,"
+                    "     avg_novelty_score   = (avg_novelty_score * claim_total_count + ?)"
+                    "                           / (claim_total_count + 1)"
+                    " WHERE node_id = ?",
+                    (1 if is_correct else 0, novelty_score, source_node_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE kg_newsletter_sources"
+                    " SET claim_total_count  = claim_total_count + 1,"
+                    "     claim_correct_count = claim_correct_count + ?"
+                    " WHERE node_id = ?",
+                    (1 if is_correct else 0, source_node_id),
+                )
+
+    # ------------------------------------------------------------------
+    # Source credibility
+    # ------------------------------------------------------------------
+
+    def get_source_credibility(self, node_id: int) -> Dict[str, Any]:
+        """Return credibility metrics for a newsletter source node."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT claim_correct_count, claim_total_count, avg_novelty_score"
+                " FROM kg_newsletter_sources WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+        if row is None:
+            return {"claim_accuracy": None, "avg_novelty_score": None}
+        total = int(row["claim_total_count"])
+        correct = int(row["claim_correct_count"])
+        return {
+            "claim_accuracy": round(correct / total, 3) if total > 0 else None,
+            "claim_total": total,
+            "claim_correct": correct,
+            "avg_novelty_score": float(row["avg_novelty_score"]),
+        }
+
+    def get_all_sources(self) -> List[Dict[str, Any]]:
+        """Return all tracked newsletter sources with credibility data."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ks.node_id, ks.publication_name, ks.sender_patterns,"
+                "       ks.email_count, n.canonical_name,"
+                "       ks.claim_correct_count, ks.claim_total_count,"
+                "       ks.avg_novelty_score,"
+                "       COALESCE(ks.sentiment_profile, '{}') AS sentiment_profile"
+                " FROM kg_newsletter_sources ks"
+                " JOIN kg_nodes n ON ks.node_id = n.id",
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Source consistency profiling
+    # ------------------------------------------------------------------
+
+    def update_source_sentiment_profile(self, node_id: int) -> Dict[str, Any]:
+        """Recompute and persist the sentiment fingerprint for a source.
+
+        Aggregates all active framings from kg_story_framings for this source,
+        counts bearish/bullish/neutral/etc. per topic, and writes a summary
+        back to kg_newsletter_sources.sentiment_profile. Returns the computed
+        profile so the caller can log or surface it.
+
+        Aggregation is read-heavy and designed to be called infrequently
+        (e.g. once per momentum check cycle, not per email).
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT sf.sentiment, t.canonical_name AS topic"
+                " FROM kg_story_framings sf"
+                " JOIN kg_edges e ON sf.story_node_id = e.from_node_id"
+                "   AND e.edge_type = 'involves' AND e.is_active = 1"
+                " JOIN kg_nodes t ON e.to_node_id = t.id AND t.node_type = 'topic'"
+                " WHERE sf.source_node_id = ? AND sf.is_active = 1",
+                (node_id,),
+            ).fetchall()
+
+        sentiment_by_topic: Dict[str, Dict[str, int]] = {}
+        for r in rows:
+            topic = r["topic"]
+            sent = r["sentiment"]
+            if topic not in sentiment_by_topic:
+                sentiment_by_topic[topic] = {}
+            sentiment_by_topic[topic][sent] = sentiment_by_topic[topic].get(sent, 0) + 1
+
+        bearish_topics = [
+            t for t, counts in sentiment_by_topic.items()
+            if counts.get("bearish", 0) > sum(counts.values()) * 0.5
+        ]
+        bullish_topics = [
+            t for t, counts in sentiment_by_topic.items()
+            if counts.get("bullish", 0) > sum(counts.values()) * 0.5
+        ]
+        total_framings = sum(sum(c.values()) for c in sentiment_by_topic.values())
+        neutral_count = sum(
+            c.get("neutral", 0) for c in sentiment_by_topic.values()
+        )
+        neutral_rate = round(neutral_count / total_framings, 3) if total_framings > 0 else 1.0
+
+        profile = {
+            "bearish_topics": bearish_topics,
+            "bullish_topics": bullish_topics,
+            "neutral_rate": neutral_rate,
+        }
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE kg_newsletter_sources SET sentiment_profile = ? WHERE node_id = ?",
+                (json.dumps(profile), node_id),
+            )
+        return profile
 
 
 _nl_store_instance: Optional[NewsletterGraphStore] = None

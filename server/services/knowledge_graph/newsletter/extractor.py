@@ -87,9 +87,21 @@ _TOOL_SCHEMA: Dict[str, Any] = {
                                 "enum": [
                                     "works_at", "sent_to", "involved_in",
                                     "mentions", "knows",
+                                    "precedes", "caused_by",
+                                    "contradicts_story", "follows_from",
                                 ],
                             },
                             "confidence": {"type": "number"},
+                            "edge_properties": {
+                                "type": "object",
+                                "description": (
+                                    "Optional semantic properties on the edge. "
+                                    "For works_at: {\"role\": \"CTO\", \"since\": \"2022\"}. "
+                                    "For involved_in: {\"capacity\": \"lead investor\"}. "
+                                    "Omit when no meaningful properties exist."
+                                ),
+                                "additionalProperties": {"type": "string"},
+                            },
                         },
                         "required": [
                             "from_entity", "to_entity", "edge_type", "confidence",
@@ -358,9 +370,16 @@ def _parse(args: Dict[str, Any]) -> NewsletterIntelligence:
             conf = float(raw.get("confidence", 1.0))
         except (TypeError, ValueError):
             conf = 1.0
+        raw_props = raw.get("edge_properties")
+        edge_properties = (
+            {str(k): str(v) for k, v in raw_props.items()}
+            if isinstance(raw_props, dict) and raw_props
+            else None
+        )
         relationships.append(ExtractedRelationship(
             from_entity=fe, to_entity=te, edge_type=et,
             confidence=max(0.0, min(1.0, conf)),
+            edge_properties=edge_properties,
         ))
 
     primary_topics = [

@@ -148,8 +148,7 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
 
     if is_new:
         roster.add_agent(agent_name)
-        touch_agent(agent_name)
-
+    touch_agent(agent_name)
 
     get_execution_agent_logs().record_request(agent_name, instructions)
 
