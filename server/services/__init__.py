@@ -23,6 +23,7 @@ from .gmail import (
 from .trigger_scheduler import get_trigger_scheduler
 from .triggers import get_trigger_service
 from .timezone_store import TimezoneStore, get_timezone_store
+from .knowledge_graph import get_knowledge_graph_watcher, KnowledgeGraphWatcher
 
 
 __all__ = [
@@ -49,4 +50,6 @@ __all__ = [
     "get_trigger_service",
     "TimezoneStore",
     "get_timezone_store",
+    "get_knowledge_graph_watcher",
+    "KnowledgeGraphWatcher",
 ]

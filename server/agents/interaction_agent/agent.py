@@ -1,19 +1,19 @@
 """Interaction agent helpers for prompt construction."""
 
-from html import escape
 from pathlib import Path
 from typing import Dict, List
+from ...services.execution.hot_cache import get_hot_cache, touch_agent
+from html import escape
 
 from ...services.execution import get_agent_roster
 
 _prompt_path = Path(__file__).parent / "system_prompt.md"
-SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8").strip()
 
 
 # Load and return the pre-defined system prompt from markdown file
 def build_system_prompt() -> str:
-    """Return the static system prompt for the interaction agent."""
-    return SYSTEM_PROMPT
+    """Read and return the interaction agent system prompt from disk."""
+    return _prompt_path.read_text(encoding="utf-8").strip()
 
 
 # Build structured message with conversation history, active agents, and current turn
@@ -43,19 +43,21 @@ def _render_conversation_history(transcript: str) -> str:
 
 # Format currently active execution agents into XML tags for LLM awareness
 def _render_active_agents() -> str:
-    roster = get_agent_roster()
-    roster.load()
-    agents = roster.get_agents()
+    """Render hot-cached agents only. Full roster available via roster_search tool."""
+    hot = get_hot_cache()
+    if not hot:
+        return "None — use roster_search to find existing agents."
 
-    if not agents:
-        return "None"
+    lines = []
+    for a in hot:
+        name = escape(a["agent_name"], quote=True)
+        status = escape(a.get("status", "unknown"), quote=True)
+        summary = escape(a.get("summary", ""), quote=True)
+        snippet = a.get("last_output_snippet", "")
+        snippet_attr = f' last_output="{escape(snippet[:120], quote=True)}"' if snippet else ""
+        lines.append(f'<agent name="{name}" status="{status}" summary="{summary}"{snippet_attr} />')
 
-    rendered: List[str] = []
-    for agent_name in agents:
-        name = escape(agent_name or "agent", quote=True)
-        rendered.append(f'<agent name="{name}" />')
-
-    return "\n".join(rendered)
+    return "\n".join(lines)
 
 
 # Wrap the current message in appropriate XML tags based on sender type

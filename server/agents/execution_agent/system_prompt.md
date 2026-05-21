@@ -33,6 +33,15 @@ You have access to the following Gmail tools:
 - gmail_forward_email: Forward an existing email
 - gmail_reply_to_thread: Reply to an email thread
 
+Before searching email for facts about a person, organization, or topic, first query the knowledge graph — it may already have the answer and save an email search:
+- query_knowledge_graph: Look up known facts about a person, organization, topic, or event. Use `entity_name` for a specific lookup, `node_type` to list all nodes of a type (person/organization/topic/event), or no arguments for graph statistics.
+  Newsletter intelligence modes (pass via `newsletter_query` parameter):
+  - `momentum_topics` — topics with accelerating newsletter coverage this week (no entity_name needed).
+  - `story_narrative` — full framing timeline for a story across all publications. Set `entity_name` to the story title or topic name.
+  - `contrarian_positions` — confirmed dissenting positions vs. the prevailing narrative. Optionally filter by topic with `entity_name`.
+  - `newsletter_sources` — all tracked publication sources in the corpus (no entity_name needed).
+  Use these when the user asks about newsletter trends, what publications are covering, how a story is being framed, or whether any source is pushing back on consensus.
+
 You also manage reminder triggers for this agent:
 - createTrigger: Store a reminder by providing the payload to run later. Supply an ISO 8601 `start_time` and an iCalendar `RRULE` when recurrence is needed.
 - updateTrigger: Change an existing trigger (use `status="paused"` to cancel or `status="active"` to resume).

@@ -217,7 +217,7 @@ def initiate_connect(payload: GmailConnectPayload, settings: Settings) -> JSONRe
     _clear_cached_profile(user_id)
     try:
         client = _get_composio_client(settings)
-        req = client.connected_accounts.initiate(user_id=user_id, auth_config_id=auth_config_id)
+        req = client.connected_accounts.link(user_id=user_id, auth_config_id=auth_config_id)
         data = {
             "ok": True,
             "redirect_url": getattr(req, "redirect_url", None) or getattr(req, "redirectUrl", None),
@@ -487,8 +487,41 @@ def execute_gmail_tool(
         )
         return _normalize_tool_response(result)
     except Exception as exc:
+        if "413" in str(exc):
+            raise RuntimeError(f"{tool_name} invocation failed: {exc}") from exc
         logger.exception(
             "gmail tool execution failed",
             extra={"tool": tool_name, "user_id": composio_user_id},
         )
         raise RuntimeError(f"{tool_name} invocation failed: {exc}") from exc
+
+
+def execute_gmail_tool_with_size_guard(
+    tool_name: str,
+    composio_user_id: str,
+    *,
+    arguments: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Like execute_gmail_tool but retries with halved max_results on Composio 413 errors.
+
+    Composio returns 413 when the response payload is too large (e.g. fetching many
+    newsletters with full bodies). Halving max_results on each attempt keeps the
+    batch within limits while preserving as many results as possible.
+    """
+    args: Dict[str, Any] = dict(arguments or {})
+    for attempt in range(3):
+        try:
+            return execute_gmail_tool(tool_name, composio_user_id, arguments=args)
+        except RuntimeError as exc:
+            if "413" not in str(exc):
+                raise
+            current = int(args.get("max_results") or 10)
+            if current <= 1:
+                raise
+            reduced = max(1, current // 2)
+            logger.warning(
+                "Composio 413: response payload too large; retrying with fewer results",
+                extra={"tool": tool_name, "from_max_results": current, "to_max_results": reduced, "attempt": attempt + 1},
+            )
+            args["max_results"] = reduced
+    raise RuntimeError(f"{tool_name}: payload too large even with max_results=1")

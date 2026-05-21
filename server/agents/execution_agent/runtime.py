@@ -3,13 +3,88 @@
 import inspect
 import json
 from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .agent import ExecutionAgent
 from .tools import get_tool_schemas, get_tool_registry
 from ...config import get_settings
 from ...openrouter_client import request_chat_completion
 from ...logging_config import logger
+from ...services.knowledge_graph import get_knowledge_graph_store
+
+
+def _build_kg_context_block(text: str) -> str:
+    """Return a pre-loaded KG context block for injection into a system prompt.
+
+    Uses ChromaDB semantic search against the kg_nodes entity collection to
+    select the most relevant entities from the graph for the given text.
+    Replaces the previous token-scan approach (uppercase word heuristic) which
+    missed short proper nouns ('AI', 'Fed') and generated false candidates from
+    capitalised sentence-start words.
+
+    Falls back gracefully to an empty string when:
+      - ChromaDB is unavailable (collection returns None)
+      - The graph is empty
+      - Any exception is raised
+
+    The top-5 semantically nearest entity names are resolved to full node
+    records (facts + edges), then formatted as a compact context block.
+    """
+    try:
+        store = get_knowledge_graph_store()
+        logger.debug("KG context block: checking node count")
+
+        node_count = store.get_node_count()
+        if node_count == 0:
+            logger.debug("KG context block: graph is empty, skipping")
+            return ""
+
+        logger.debug("KG context block: running semantic search (node_count=%d)", node_count)
+
+        # Semantic candidate selection via ChromaDB embedding search
+        candidates = store.query_entities_semantically(text, n_results=5)
+
+        if not candidates:
+            logger.debug("KG context block: semantic search returned no candidates")
+            return ""
+
+        logger.debug("KG context block: resolving %d candidates to full nodes", len(candidates))
+
+        seen_ids: set[int] = set()
+        hits: list[dict] = []
+        for candidate in candidates:
+            node = store.query_node_by_name(
+                candidate["canonical_name"],
+                node_type=candidate["node_type"] or None,
+            )
+            if node and node["id"] not in seen_ids:
+                seen_ids.add(node["id"])
+                hits.append(node)
+
+        if not hits:
+            logger.debug("KG context block: candidates found but none resolved to full nodes")
+            return ""
+
+        lines = [
+            "# Knowledge Graph Context",
+            "The following facts about relevant entities are pre-loaded from the user's email history:",
+        ]
+        for node in hits[:8]:
+            lines.append(f"\n**{node['canonical_name']}** ({node['node_type']})")
+            for fact in node["facts"][:5]:
+                lines.append(f"  - {fact['fact_key']}: {fact['fact_value']}")
+            for edge in node["edges"][:3]:
+                lines.append(f"  - {edge['edge_type']} → {edge['to_name']}")
+
+        logger.debug("KG context block built via semantic search (entities=%d)", len(hits))
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.warning(
+            "KG context block build failed: %s",
+            exc,
+            exc_info=True,
+        )
+        return ""
 
 
 @dataclass
@@ -19,7 +94,7 @@ class ExecutionResult:
     success: bool
     response: str
     error: Optional[str] = None
-    tools_executed: List[str] = None
+    tools_executed: List[str] = field(default_factory=list)
 
 
 class ExecutionAgentRuntime:
@@ -39,12 +114,29 @@ class ExecutionAgentRuntime:
         if not self.api_key:
             raise ValueError("OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable.")
 
+    def _prefetch_kg_context(self, instructions: str) -> str:
+        """Return a pre-loaded KG context block for injection into the system prompt.
+
+        Delegates to the module-level _build_kg_context_block which uses ChromaDB
+        semantic search for candidate selection (see that function's docstring).
+        """
+        context = _build_kg_context_block(instructions)
+        if context:
+            logger.debug(
+                "KG context pre-fetched for execution agent",
+                extra={"agent": self.agent.name},
+            )
+        return context
+
     # Main execution loop for running agent with LLM calls and tool execution
     async def execute(self, instructions: str) -> ExecutionResult:
         """Execute the agent with given instructions."""
         try:
             # Build system prompt with history
             system_prompt = self.agent.build_system_prompt_with_history()
+            kg_context = self._prefetch_kg_context(instructions)
+            if kg_context:
+                system_prompt = f"{system_prompt}\n\n{kg_context}"
 
             # Start conversation with the instruction
             messages = [{"role": "user", "content": instructions}]

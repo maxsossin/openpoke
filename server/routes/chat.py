@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 
 from ..models import ChatHistoryClearResponse, ChatHistoryResponse, ChatRequest
 from ..services import get_conversation_log, get_trigger_service, handle_chat_request
+from ..services.execution.hot_cache import reset_session_cache
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -41,6 +42,8 @@ def clear_history() -> ChatHistoryClearResponse:
     # Clear stored triggers
     trigger_service = get_trigger_service()
     trigger_service.clear_all()
+
+    reset_session_cache()
 
     return ChatHistoryClearResponse()
 

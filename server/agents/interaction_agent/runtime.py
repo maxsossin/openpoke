@@ -4,12 +4,81 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+import json as _json
+
 from .agent import build_system_prompt, prepare_message_with_history
 from .tools import ToolResult, get_tool_schemas, handle_tool_call
 from ...config import get_settings
 from ...services.conversation import get_conversation_log, get_working_memory_log
 from ...openrouter_client import request_chat_completion
 from ...logging_config import logger
+from ..execution_agent.runtime import _build_kg_context_block
+
+
+def _build_newsletter_source_context(user_message: str) -> str:
+    """Return a sentiment profile block for newsletter sources mentioned in user_message.
+
+    Runs a semantic search for newsletter_source nodes, then for each found source
+    fetches its sentiment_profile from kg_newsletter_sources. Only included when at
+    least one newsletter_source node is semantically relevant to the query.
+    """
+    try:
+        from ...services.knowledge_graph import get_knowledge_graph_store
+        from ...services.knowledge_graph.newsletter.store_ext import get_newsletter_graph_store
+
+        kg_store = get_knowledge_graph_store()
+        if kg_store.get_node_count() == 0:
+            return ""
+
+        candidates = kg_store.query_entities_semantically(user_message, n_results=5)
+        source_nodes = [
+            c for c in candidates if c.get("node_type") == "newsletter_source"
+        ]
+        if not source_nodes:
+            return ""
+
+        nl_store = get_newsletter_graph_store()
+        all_sources = nl_store.get_all_sources()
+        profile_by_node_id = {
+            s["node_id"]: s.get("sentiment_profile", "{}") for s in all_sources
+        }
+
+        lines = ["\n# Newsletter Source Sentiment Profiles"]
+        found = 0
+        for candidate in source_nodes:
+            node = kg_store.query_node_by_name(
+                candidate["canonical_name"], node_type="newsletter_source"
+            )
+            if node is None:
+                continue
+            raw_profile = profile_by_node_id.get(node["id"], "{}")
+            try:
+                profile = (
+                    _json.loads(raw_profile) if isinstance(raw_profile, str) else raw_profile
+                )
+            except Exception:
+                profile = {}
+            if not profile:
+                continue
+            lines.append(f"\n**{node['canonical_name']}** sentiment fingerprint:")
+            if profile.get("bearish_topics"):
+                lines.append(f"  - Consistently bearish on: {', '.join(profile['bearish_topics'][:5])}")
+            if profile.get("bullish_topics"):
+                lines.append(f"  - Consistently bullish on: {', '.join(profile['bullish_topics'][:5])}")
+            neutral_rate = profile.get("neutral_rate")
+            if neutral_rate is not None:
+                lines.append(f"  - Neutral framing rate: {neutral_rate:.0%}")
+            found += 1
+
+        if found == 0:
+            return ""
+        logger.debug(
+            "Newsletter source sentiment profiles injected", extra={"sources": found}
+        )
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.debug("Newsletter source context build failed: %s", exc)
+        return ""
 
 
 @dataclass
@@ -70,6 +139,26 @@ class InteractionAgentRuntime:
             self.conversation_log.record_user_message(user_message)
 
             system_prompt = build_system_prompt()
+            # Proactive KG context injection: embed relevant entity facts directly
+            # into the system prompt when the user's message references graph entities.
+            # This allows the agent to answer entity questions in a single turn without
+            # an extra query_knowledge_graph tool call round-trip.
+            kg_context = _build_kg_context_block(user_message)
+            if kg_context:
+                system_prompt = f"{system_prompt}\n\n{kg_context}"
+            source_context = _build_newsletter_source_context(user_message)
+            if source_context:
+                system_prompt = f"{system_prompt}\n\n{source_context}"
+            if kg_context or source_context:
+                logger.debug(
+                    "KG context injected into interaction agent system prompt",
+                    extra={"prompt_length": len(system_prompt)},
+                )
+            else:
+                logger.debug(
+                    "Interaction agent system prompt loaded",
+                    extra={"prompt_length": len(system_prompt)},
+                )
             messages = prepare_message_with_history(
                 user_message, transcript_before, message_type="user"
             )
@@ -89,7 +178,7 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent failed", extra={"error": str(exc)})
+            logger.exception("Interaction agent failed: %s", exc)
             return InteractionResult(
                 success=False,
                 response="",
@@ -124,7 +213,7 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent (agent message) failed", extra={"error": str(exc)})
+            logger.exception("Interaction agent (agent message) failed: %s", exc)
             return InteractionResult(
                 success=False,
                 response="",
@@ -142,7 +231,12 @@ class InteractionAgentRuntime:
         summary = _LoopSummary()
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
-            response = await self._make_llm_call(system_prompt, messages)
+            logger.debug("Interaction loop iteration %d", iteration)
+            try:
+                response = await self._make_llm_call(system_prompt, messages)
+            except Exception as exc:
+                logger.exception("LLM call failed on iteration %d: %s", iteration, exc)
+                raise
             assistant_message = self._extract_assistant_message(response)
 
             assistant_content = (assistant_message.get("content") or "").strip()
@@ -163,6 +257,7 @@ class InteractionAgentRuntime:
             if not parsed_tool_calls:
                 break
 
+            wait_called = False
             for tool_call in parsed_tool_calls:
                 summary.tool_names.append(tool_call.name)
 
@@ -170,6 +265,9 @@ class InteractionAgentRuntime:
                     agent_name = tool_call.arguments.get("agent_name")
                     if isinstance(agent_name, str) and agent_name:
                         summary.execution_agents.add(agent_name)
+
+                if tool_call.name == "wait":
+                    wait_called = True
 
                 result = self._execute_tool(tool_call)
 
@@ -182,6 +280,9 @@ class InteractionAgentRuntime:
                     "content": self._format_tool_result(tool_call, result),
                 }
                 messages.append(tool_message)
+
+            if wait_called:
+                break
         else:
             raise RuntimeError("Reached tool iteration limit without final response")
 
