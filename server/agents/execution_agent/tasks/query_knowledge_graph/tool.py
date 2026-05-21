@@ -280,6 +280,25 @@ def _handle_newsletter_query(
             ),
         }
 
+    if mode == "cross_story_relationships":
+        if not entity_name or not entity_name.strip():
+            return {
+                "error": "cross_story_relationships requires entity_name set to a story title"
+            }
+        name = entity_name.strip()
+        story_node = kg_store.query_node_by_name(name, node_type="story")
+        if story_node is None:
+            candidates = kg_store.search_nodes(name)
+            if candidates:
+                return {
+                    "result": None,
+                    "message": f"No exact story match for '{name}'.",
+                    "candidates": candidates,
+                }
+            return {"result": None, "message": f"No story node found matching '{name}'."}
+        relationships = nl_store.get_cross_story_relationships(story_node["id"])
+        return {"mode": "cross_story_relationships", **relationships}
+
     return {"error": f"Unknown newsletter_query mode: '{mode}'"}
 
 

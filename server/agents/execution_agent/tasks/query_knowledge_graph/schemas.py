@@ -29,7 +29,10 @@ _SCHEMAS: List[Dict[str, Any]] = [
                 "  'topics_covered_by_source' — topic nodes reachable from a source via "
                 "covers → involves edges. entity_name is the publication name.\n"
                 "  'source_consistency_profile' — per-topic sentiment fingerprint for a "
-                "publication. entity_name is the publication name."
+                "publication. entity_name is the publication name.\n"
+                "  'cross_story_relationships' — follows contradicts_story and follows_from "
+                "edges from a story to return related stories with their latest framings. "
+                "Requires entity_name set to a story title."
             ),
             "parameters": {
                 "type": "object",
@@ -74,6 +77,7 @@ _SCHEMAS: List[Dict[str, Any]] = [
                             "stories_covering_topic",
                             "topics_covered_by_source",
                             "source_consistency_profile",
+                            "cross_story_relationships",
                         ],
                         "description": (
                             "Activate a newsletter-specific query mode. "
@@ -84,7 +88,9 @@ _SCHEMAS: List[Dict[str, Any]] = [
                             "newsletter_sources: all tracked publications with credibility data. "
                             "stories_covering_topic: stories linked to entity_name topic. "
                             "topics_covered_by_source: topics covered by entity_name publication. "
-                            "source_consistency_profile: sentiment fingerprint for entity_name publication."
+                            "source_consistency_profile: sentiment fingerprint for entity_name publication. "
+                            "cross_story_relationships: follow contradicts_story and follows_from "
+                            "edges from entity_name story to related stories with framings."
                         ),
                     },
                     "reverse_lookup": {

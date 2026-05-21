@@ -226,7 +226,9 @@ async def _assess_via_llm(
 
     prevailing_lines = []
     for f in prevailing_framings[:8]:
-        line = f"  [{f['source_name']} / {f['sentiment']}]: {f['framing_text']}"
+        accuracy = f.get("claim_accuracy")
+        accuracy_tag = f" accuracy={accuracy:.0%}" if accuracy is not None else ""
+        line = f"  [{f['source_name']}{accuracy_tag} / {f['sentiment']}]: {f['framing_text']}"
         claim = (f.get("key_claim") or "").strip()
         if claim:
             line += f" [CLAIM: {claim}]"

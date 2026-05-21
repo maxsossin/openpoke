@@ -8,7 +8,8 @@ from ...logging_config import logger
 
 
 # Load system prompt template from file
-_prompt_path = Path(__file__).parent / "system_prompt.md"
+_PROMPT_DIR = Path(__file__).parent
+_prompt_path = _PROMPT_DIR / "system_prompt.md"
 if _prompt_path.exists():
     SYSTEM_PROMPT_TEMPLATE = _prompt_path.read_text(encoding="utf-8").strip()
 else:
@@ -27,6 +28,26 @@ You have access to Gmail tools to help complete your tasks. When given instructi
 3. Provide clear status updates on your actions
 
 Be thorough, accurate, and efficient in your execution."""
+
+
+def _load_agent_prompt(agent_name: str) -> Optional[str]:
+    """Return a per-agent system prompt override if one exists on disk.
+
+    Looks for system_prompt_<sanitized_name>.md in the same directory as
+    system_prompt.md. Sanitization: lowercase, non-alphanumeric characters
+    replaced with underscores.
+
+    Returns None when no override file is found, signalling the caller to
+    use the generic SYSTEM_PROMPT_TEMPLATE instead.
+    """
+    sanitized = "".join(
+        c if c.isalnum() else "_"
+        for c in agent_name.lower()
+    )
+    path = _PROMPT_DIR / f"system_prompt_{sanitized}.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    return None
 
 
 class ExecutionAgent:
@@ -49,11 +70,20 @@ class ExecutionAgent:
         self.conversation_limit = conversation_limit
         self._log_store = get_execution_agent_logs()
 
-    # Generate system prompt template with agent name and purpose derived from name
+    # Generate system prompt, using a per-agent override file when one exists
     def build_system_prompt(self) -> str:
-        """Build the system prompt for this agent."""
-        agent_purpose = f"Handle tasks related to: {self.name}"
+        """Build the system prompt for this agent.
 
+        When a per-agent override file exists (system_prompt_<name>.md),
+        that file is returned as-is without template substitution.
+        Otherwise the shared SYSTEM_PROMPT_TEMPLATE is used with
+        {agent_name} and {agent_purpose} filled in.
+        """
+        override = _load_agent_prompt(self.name)
+        if override is not None:
+            return override
+
+        agent_purpose = f"Handle tasks related to: {self.name}"
         return SYSTEM_PROMPT_TEMPLATE.format(
             agent_name=self.name,
             agent_purpose=agent_purpose

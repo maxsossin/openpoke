@@ -6,7 +6,6 @@ operation across both stores is serialised through a single mutex.
 
 Tables added (all additive, never replace existing):
     kg_newsletter_sources   — publication fingerprints per node_id
-    kg_newsletter_meta      — per-email newsletter classification record
     kg_story_framings       — per-source story perspectives (divergence preserved)
     kg_topic_attention      — daily windowed attention for momentum tracking
     kg_contrarian_positions — dissenting positions with evidence accumulation
@@ -37,13 +36,6 @@ CREATE TABLE IF NOT EXISTS kg_newsletter_sources (
     sender_patterns   TEXT    NOT NULL DEFAULT '[]',
     first_seen_at     TEXT    NOT NULL,
     email_count       INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS kg_newsletter_meta (
-    email_id        TEXT    PRIMARY KEY,
-    source_node_id  INTEGER REFERENCES kg_nodes(id),
-    is_newsletter   INTEGER NOT NULL DEFAULT 0,
-    detected_at     TEXT    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS kg_story_framings (
@@ -146,6 +138,12 @@ _MIGRATIONS = [
     # Novelty at first observation — 1.0 for all pre-existing rows (safe on populated databases).
     "ALTER TABLE kg_node_facts ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
     "ALTER TABLE kg_edges ADD COLUMN novelty_score REAL NOT NULL DEFAULT 1.0",
+    # Claim verifier: stamp when a pending claim was last evaluated so the verifier
+    # skips recently checked claims that had insufficient evidence at check time.
+    "ALTER TABLE kg_claims ADD COLUMN last_checked_at TEXT",
+    # Novelty score at claim insert time — fed through record_claim_verdict into
+    # avg_novelty_score on kg_newsletter_sources without an extra lookup.
+    "ALTER TABLE kg_claims ADD COLUMN novelty_score REAL",
 ]
 
 
@@ -235,32 +233,6 @@ class NewsletterGraphStore:
 
 
     # ------------------------------------------------------------------
-    # Newsletter email metadata
-    # ------------------------------------------------------------------
-
-    def record_newsletter_meta(
-        self,
-        email_id: str,
-        source_node_id: Optional[int],
-        is_newsletter: bool,
-    ) -> None:
-        now = _utc_now_iso()
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO kg_newsletter_meta"
-                " (email_id, source_node_id, is_newsletter, detected_at)"
-                " VALUES (?, ?, ?, ?)",
-                (email_id, source_node_id, int(is_newsletter), now),
-            )
-
-    def update_newsletter_meta_source(self, email_id: str, source_node_id: int) -> None:
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE kg_newsletter_meta SET source_node_id = ? WHERE email_id = ?",
-                (source_node_id, email_id),
-            )
-
-    # ------------------------------------------------------------------
     # Story framings (divergent perspectives — never collapsed)
     # ------------------------------------------------------------------
 
@@ -334,9 +306,11 @@ class NewsletterGraphStore:
             base = (
                 "SELECT sf.framing_text, sf.sentiment, sf.source_email_ts,"
                 "       n.canonical_name AS source_name, sf.source_node_id,"
-                "       COALESCE(sf.key_claim, '') AS key_claim"
+                "       COALESCE(sf.key_claim, '') AS key_claim,"
+                "       ns.claim_correct_count, ns.claim_total_count"
                 " FROM kg_story_framings sf"
                 " JOIN kg_nodes n ON sf.source_node_id = n.id"
+                " LEFT JOIN kg_newsletter_sources ns ON sf.source_node_id = ns.node_id"
                 f" WHERE sf.story_node_id = ? AND sf.is_active = 1{date_clause}{excl_clause}"
                 " ORDER BY sf.source_email_ts DESC LIMIT ?"
             )
@@ -347,7 +321,15 @@ class NewsletterGraphStore:
                 params.append(exclude_source_id)
             params.append(limit)
             rows = conn.execute(base, params).fetchall()
-        return [dict(r) for r in rows]
+
+        result = []
+        for r in rows:
+            row = dict(r)
+            total = row.pop("claim_total_count") or 0
+            correct = row.pop("claim_correct_count") or 0
+            row["claim_accuracy"] = round(correct / total, 3) if total > 0 else None
+            result.append(row)
+        return result
 
     def get_recent_framings_for_topic(
         self,
@@ -845,6 +827,80 @@ class NewsletterGraphStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_cross_story_relationships(
+        self,
+        story_node_id: int,
+    ) -> Dict[str, Any]:
+        """Follow contradicts_story and follows_from edges to return related stories.
+
+        Traverses kg_edges in both directions for each edge type:
+          contradicts_story — stories that contradict this one, and stories this one contradicts
+          follows_from      — stories this one follows from, and stories that follow from this one
+
+        For each related story, fetches its most recent active framing summary.
+        Returns empty relationship lists when no such edges exist yet.
+        """
+        with self._lock, self._connect() as conn:
+            story_row = conn.execute(
+                "SELECT canonical_name FROM kg_nodes WHERE id = ? AND node_type = 'story'",
+                (story_node_id,),
+            ).fetchone()
+            if story_row is None:
+                return {"error": f"No story node with id {story_node_id}"}
+
+            def _fetch_related(edge_type: str, direction: str) -> List[Dict[str, Any]]:
+                if direction == "from":
+                    # story_node_id → (edge_type) → other
+                    rows = conn.execute(
+                        "SELECT n.id, n.canonical_name"
+                        " FROM kg_edges e"
+                        " JOIN kg_nodes n ON e.to_node_id = n.id AND n.node_type = 'story'"
+                        " WHERE e.from_node_id = ? AND e.edge_type = ? AND e.is_active = 1",
+                        (story_node_id, edge_type),
+                    ).fetchall()
+                else:
+                    # other → (edge_type) → story_node_id
+                    rows = conn.execute(
+                        "SELECT n.id, n.canonical_name"
+                        " FROM kg_edges e"
+                        " JOIN kg_nodes n ON e.from_node_id = n.id AND n.node_type = 'story'"
+                        " WHERE e.to_node_id = ? AND e.edge_type = ? AND e.is_active = 1",
+                        (story_node_id, edge_type),
+                    ).fetchall()
+                result = []
+                for r in rows:
+                    framing_row = conn.execute(
+                        "SELECT framing_text, sentiment, source_email_ts"
+                        " FROM kg_story_framings"
+                        " WHERE story_node_id = ? AND is_active = 1"
+                        " ORDER BY source_email_ts DESC LIMIT 1",
+                        (r["id"],),
+                    ).fetchone()
+                    entry: Dict[str, Any] = {
+                        "story_id": r["id"],
+                        "story_name": r["canonical_name"],
+                    }
+                    if framing_row:
+                        entry["latest_framing"] = framing_row["framing_text"]
+                        entry["sentiment"] = framing_row["sentiment"]
+                        entry["framing_date"] = framing_row["source_email_ts"]
+                    result.append(entry)
+                return result
+
+            contradicts_outbound = _fetch_related("contradicts_story", "from")
+            contradicts_inbound = _fetch_related("contradicts_story", "to")
+            follows_outbound = _fetch_related("follows_from", "from")
+            follows_inbound = _fetch_related("follows_from", "to")
+
+        return {
+            "story_id": story_node_id,
+            "story_name": story_row["canonical_name"],
+            "contradicts": contradicts_outbound,
+            "contradicted_by": contradicts_inbound,
+            "follows_from": follows_outbound,
+            "followed_by": follows_inbound,
+        }
+
     # ------------------------------------------------------------------
     # Claim tracking
     # ------------------------------------------------------------------
@@ -857,20 +913,24 @@ class NewsletterGraphStore:
         claim_text: str,
         claim_date: str,
         source_email_id: str,
+        novelty_score: Optional[float] = None,
     ) -> int:
         """Insert a new claim record and return its ID.
 
         Persists the key_claim extracted by the newsletter LLM into a
         dedicated table linked to the story and source. Verification status
         starts as 'pending' and is updated by external verification passes.
+        novelty_score is stored so record_claim_verdict can pass it to
+        mark_claim_verified without an extra read.
         """
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO kg_claims"
                 " (story_node_id, source_node_id, claim_text, claim_date,"
-                "  verification_status, verified_at, source_email_id)"
-                " VALUES (?, ?, ?, ?, 'pending', NULL, ?)",
-                (story_node_id, source_node_id, claim_text, claim_date, source_email_id),
+                "  verification_status, verified_at, source_email_id, novelty_score)"
+                " VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)",
+                (story_node_id, source_node_id, claim_text, claim_date, source_email_id,
+                 novelty_score),
             )
             return cursor.lastrowid  # type: ignore[return-value]
 
@@ -943,6 +1003,123 @@ class NewsletterGraphStore:
                     " WHERE node_id = ?",
                     (1 if is_correct else 0, source_node_id),
                 )
+
+    def expire_claim(self, claim_id: int) -> None:
+        """Mark a pending claim as expired without updating source credibility.
+
+        Expiry means the claim's time horizon passed without observable resolution.
+        It is NOT an accuracy signal — credibility counts are intentionally left
+        untouched. Only transitions from 'pending'; silently no-ops on terminal rows.
+        """
+        now = _utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE kg_claims"
+                " SET verification_status = 'expired', verified_at = ?"
+                " WHERE id = ? AND verification_status = 'pending'",
+                (now, claim_id),
+            )
+
+    def mark_claim_last_checked(self, claim_id: int) -> None:
+        """Stamp last_checked_at on a claim that was evaluated but not resolved.
+
+        Called by the verifier when a pending claim had insufficient evidence.
+        Prevents the same claim from being re-fetched until the cooldown window
+        (not_checked_since_hours in get_pending_claims) has elapsed.
+        """
+        now = _utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE kg_claims SET last_checked_at = ? WHERE id = ?",
+                (now, claim_id),
+            )
+
+    def get_claim_by_id(self, claim_id: int) -> Optional[Dict[str, Any]]:
+        """Return a single claim row by ID regardless of verification status.
+
+        Used by the verifier to inspect current status before writing a verdict,
+        and to fetch claim metadata when evidence is gathered after the initial
+        batch selection.
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT c.id, c.claim_text, c.claim_date, c.story_node_id,"
+                "       c.source_node_id, c.source_email_id,"
+                "       c.verification_status, c.verified_at, c.last_checked_at,"
+                "       c.novelty_score,"
+                "       ns.canonical_name AS story_name,"
+                "       src.canonical_name AS source_name"
+                " FROM kg_claims c"
+                " LEFT JOIN kg_nodes ns ON c.story_node_id = ns.id"
+                " LEFT JOIN kg_nodes src ON c.source_node_id = src.id"
+                " WHERE c.id = ?",
+                (claim_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_related_claims_for_story(
+        self,
+        story_node_id: int,
+        *,
+        exclude_claim_id: int,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return other claims on the same story node.
+
+        Used by the verifier as supplementary context: previously verified claims
+        on the same story inform confidence without substituting for primary
+        framing evidence.
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.claim_text, c.claim_date, c.verification_status,"
+                "       n.canonical_name AS source_name"
+                " FROM kg_claims c"
+                " LEFT JOIN kg_nodes n ON c.source_node_id = n.id"
+                " WHERE c.story_node_id = ? AND c.id != ?"
+                " ORDER BY c.claim_date DESC LIMIT ?",
+                (story_node_id, exclude_claim_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pending_claims(
+        self,
+        limit: int = 10,
+        *,
+        not_checked_since_hours: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return pending claims that have not been checked recently.
+
+        Selects rows where verification_status = 'pending' and either
+        last_checked_at is NULL or older than not_checked_since_hours ago.
+        Excludes claims whose story_node has been soft-deleted (is_deprecated = 1).
+        Orders by claim_date ASC — oldest claims are most likely to have resolved
+        and should be evaluated first.
+
+        not_checked_since_hours (default 20): prevents re-evaluating claims the
+        verifier checked recently and found insufficient evidence. At the default
+        6-hour trigger interval, a claim is checked at most once per day.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=not_checked_since_hours)
+        ).isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.claim_text, c.claim_date, c.story_node_id,"
+                "       c.source_node_id, c.source_email_id, c.last_checked_at,"
+                "       ns.canonical_name AS story_name,"
+                "       src.canonical_name AS source_name"
+                " FROM kg_claims c"
+                " LEFT JOIN kg_nodes ns ON c.story_node_id = ns.id"
+                " LEFT JOIN kg_nodes src ON c.source_node_id = src.id"
+                " WHERE c.verification_status = 'pending'"
+                "   AND (c.last_checked_at IS NULL OR c.last_checked_at < ?)"
+                "   AND (ns.id IS NULL OR ns.is_deprecated = 0)"
+                " ORDER BY c.claim_date ASC"
+                " LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Source credibility

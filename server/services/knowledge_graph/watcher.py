@@ -10,6 +10,7 @@ from ..gmail.client import execute_gmail_tool_with_size_guard as execute_gmail_t
 from ..gmail.processing import EmailTextCleaner, ProcessedEmail, parse_gmail_fetch_response
 from .extractor import ExtractionResult, extract_from_email
 from .store import KnowledgeGraphStore, get_knowledge_graph_store
+from .newsletter.novelty import compute_fact_novelty_score
 from .newsletter.processor import NewsletterProcessingResult, get_newsletter_processor
 from ...logging_config import logger
 
@@ -242,7 +243,22 @@ class KnowledgeGraphWatcher:
                 )
                 name_to_node_id[entity.canonical_name] = node_id
 
+                existing_node = self._store.query_node_by_name(
+                    entity.canonical_name, node_type=entity.node_type
+                )
+                existing_facts: dict[str, str] = {}
+                if existing_node:
+                    existing_facts = {
+                        f["fact_key"]: f["fact_value"]
+                        for f in existing_node.get("facts", [])
+                    }
+
                 for fact in entity.facts:
+                    fact_novelty = compute_fact_novelty_score(
+                        new_value=fact.value,
+                        existing_value=existing_facts.get(fact.key),
+                        recent_newsletter_mentions=0,
+                    )
                     inserted, contradiction = self._store.upsert_fact(
                         node_id=node_id,
                         fact_key=fact.key,
@@ -251,6 +267,7 @@ class KnowledgeGraphWatcher:
                         source_email_id=email.id,
                         source_email_timestamp=source_email_timestamp,
                         extracted_at=extracted_at,
+                        novelty_score=fact_novelty,
                     )
                     if contradiction:
                         logger.info(

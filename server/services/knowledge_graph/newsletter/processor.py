@@ -95,11 +95,6 @@ class NewsletterIntelligenceProcessor:
         classification = classify_newsletter(email)
 
         if not classification.is_newsletter:
-            self._nl_store.record_newsletter_meta(
-                email_id=email.id,
-                source_node_id=None,
-                is_newsletter=False,
-            )
             return None
 
         logger.debug(
@@ -114,13 +109,6 @@ class NewsletterIntelligenceProcessor:
         # Phase 1: ensure source node
         source_node_id = self._ensure_source_node(classification)
         self._nl_store.increment_source_email_count(source_node_id)
-        # Write meta with source_node_id known — single atomic write avoids a
-        # NULL source_node_id record if the process crashes between record and update.
-        self._nl_store.record_newsletter_meta(
-            email_id=email.id,
-            source_node_id=source_node_id,
-            is_newsletter=True,
-        )
 
         # Phase 2: newsletter-specific LLM extraction
         intelligence = await extract_newsletter_intelligence(email)
@@ -172,13 +160,18 @@ class NewsletterIntelligenceProcessor:
             and intelligence.key_claim.strip()
         ):
             try:
+                claim_novelty = (
+                    max(topic_novelty_scores.values()) if topic_novelty_scores else 1.0
+                )
                 self._nl_store.insert_claim(
                     story_node_id=story_result.story_node_id,
                     source_node_id=source_node_id,
                     claim_text=intelligence.key_claim,
                     claim_date=email.timestamp.date().isoformat(),
                     source_email_id=email.id,
+                    novelty_score=claim_novelty,
                 )
+                self._nl_store.increment_claim_count(source_node_id)
             except Exception as exc:
                 logger.exception(
                     "Claim persistence failed [email=%s]: %s", email.id, exc,

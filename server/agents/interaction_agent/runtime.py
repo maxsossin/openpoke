@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+import json as _json
+
 from .agent import build_system_prompt, prepare_message_with_history
 from .tools import ToolResult, get_tool_schemas, handle_tool_call
 from ...config import get_settings
@@ -11,6 +13,72 @@ from ...services.conversation import get_conversation_log, get_working_memory_lo
 from ...openrouter_client import request_chat_completion
 from ...logging_config import logger
 from ..execution_agent.runtime import _build_kg_context_block
+
+
+def _build_newsletter_source_context(user_message: str) -> str:
+    """Return a sentiment profile block for newsletter sources mentioned in user_message.
+
+    Runs a semantic search for newsletter_source nodes, then for each found source
+    fetches its sentiment_profile from kg_newsletter_sources. Only included when at
+    least one newsletter_source node is semantically relevant to the query.
+    """
+    try:
+        from ...services.knowledge_graph import get_knowledge_graph_store
+        from ...services.knowledge_graph.newsletter.store_ext import get_newsletter_graph_store
+
+        kg_store = get_knowledge_graph_store()
+        if kg_store.get_node_count() == 0:
+            return ""
+
+        candidates = kg_store.query_entities_semantically(user_message, n_results=5)
+        source_nodes = [
+            c for c in candidates if c.get("node_type") == "newsletter_source"
+        ]
+        if not source_nodes:
+            return ""
+
+        nl_store = get_newsletter_graph_store()
+        all_sources = nl_store.get_all_sources()
+        profile_by_node_id = {
+            s["node_id"]: s.get("sentiment_profile", "{}") for s in all_sources
+        }
+
+        lines = ["\n# Newsletter Source Sentiment Profiles"]
+        found = 0
+        for candidate in source_nodes:
+            node = kg_store.query_node_by_name(
+                candidate["canonical_name"], node_type="newsletter_source"
+            )
+            if node is None:
+                continue
+            raw_profile = profile_by_node_id.get(node["id"], "{}")
+            try:
+                profile = (
+                    _json.loads(raw_profile) if isinstance(raw_profile, str) else raw_profile
+                )
+            except Exception:
+                profile = {}
+            if not profile:
+                continue
+            lines.append(f"\n**{node['canonical_name']}** sentiment fingerprint:")
+            if profile.get("bearish_topics"):
+                lines.append(f"  - Consistently bearish on: {', '.join(profile['bearish_topics'][:5])}")
+            if profile.get("bullish_topics"):
+                lines.append(f"  - Consistently bullish on: {', '.join(profile['bullish_topics'][:5])}")
+            neutral_rate = profile.get("neutral_rate")
+            if neutral_rate is not None:
+                lines.append(f"  - Neutral framing rate: {neutral_rate:.0%}")
+            found += 1
+
+        if found == 0:
+            return ""
+        logger.debug(
+            "Newsletter source sentiment profiles injected", extra={"sources": found}
+        )
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.debug("Newsletter source context build failed: %s", exc)
+        return ""
 
 
 @dataclass
@@ -78,6 +146,10 @@ class InteractionAgentRuntime:
             kg_context = _build_kg_context_block(user_message)
             if kg_context:
                 system_prompt = f"{system_prompt}\n\n{kg_context}"
+            source_context = _build_newsletter_source_context(user_message)
+            if source_context:
+                system_prompt = f"{system_prompt}\n\n{source_context}"
+            if kg_context or source_context:
                 logger.debug(
                     "KG context injected into interaction agent system prompt",
                     extra={"prompt_length": len(system_prompt)},
